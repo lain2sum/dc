@@ -1,0 +1,3166 @@
+from serviceshared import constants
+from serviceshared.constants import (
+    LAST_ONLINE_DEFAULT_NAME,
+    LAST_ONLINE_DEFAULT_SECONDS,
+    MAX_RELATED_CLUBS,
+    MIN_CLUB_PAGE_MEMBERS,
+)
+from service.api.search.sql.search import SORT_MATCH_PERCENTAGE
+from serviceshared.gold.sql import club_quota_sql, has_gold_sql
+from serviceshared.commonsql import (
+    PHOTO_GEOMETRY,
+    computed_flair_sql,
+    Q_IS_ALLOWED_CLUB_NAME,
+    Q_IS_REGISTERED_BY_NORMALIZED_EMAIL,
+)
+
+MAX_CLUB_SEARCH_RESULTS = 20
+
+MAX_SUGGESTED_CLUBS = 12
+
+MAX_SEARCH_FILTER_ANSWERS = 20
+
+# How often the user should be nagged to donate, in days. The frequency
+# increases as funds run out.
+_Q_DONATION_NAG_FREQUENCY = """
+SELECT
+    make_interval(
+        days => greatest(2, estimated_end_date::date - NOW()::date) / 2
+    )
+FROM
+    funding
+"""
+
+_Q_DO_SHOW_DONATION_NAG = f"""
+(
+        {{table}}.sign_up_time < NOW() - ({_Q_DONATION_NAG_FREQUENCY})
+    AND
+        {{table}}.count_answers >= 25
+) AS do_show_donation_nag
+"""
+
+_Q_ESTIMATED_END_DATE = """
+(SELECT iso8601_utc(estimated_end_date) FROM funding) AS estimated_end_date
+"""
+
+Q_SELECT_PERSONALITY = """
+SELECT
+    CASE
+        WHEN %(topic)s::TEXT = 'Big 5' AND trait.name = 'Introversion/Extraversion'
+        THEN 'Extraversion'
+        ELSE trait.name
+    END                               AS trait_name,
+    CASE
+        WHEN %(topic)s::TEXT = 'Big 5' AND trait.name = 'Introversion/Extraversion'
+        THEN NULL
+        ELSE trait.min_label
+    END                               AS trait_min_label,
+    CASE
+        WHEN %(topic)s::TEXT = 'Big 5' AND trait.name = 'Introversion/Extraversion'
+        THEN NULL
+        ELSE trait.max_label
+    END                               AS trait_max_label,
+    trait.description                 AS trait_description,
+    person_trait.name                 AS person_name,
+    person_trait.tiny_id              AS person_id,
+    ROUND(100 * person_trait.ratio)   AS person_percentage,
+    prospect_trait.name               AS prospect_name,
+    ROUND(100 * prospect_trait.ratio) AS prospect_percentage,
+    CASE
+        WHEN %(prospect_person_id)s IS NOT NULL
+        THEN COALESCE(prospect_trait.ratio, 0)
+        ELSE COALESCE(person_trait.ratio, 0)
+    END AS position
+FROM
+    trait
+LEFT JOIN
+    (
+        SELECT
+            id,
+            tiny_id,
+            name,
+            (trait_ratio(presence_score, absence_score, 5000)).*
+        FROM
+            person
+        WHERE
+            id = %(person_id_as_int)s::INT
+        OR
+            tiny_id = %(person_id_as_str)s::TEXT
+    ) AS person_trait
+ON
+    person_trait.trait_id = trait.id
+LEFT JOIN
+    (
+        SELECT
+            id,
+            name,
+            (trait_ratio(presence_score, absence_score, 5000)).*
+        FROM person
+        WHERE id = %(prospect_person_id)s
+    ) AS prospect_trait
+ON
+    prospect_trait.trait_id = trait.id
+WHERE
+    trait.id IN (
+        SELECT trait_id
+        FROM trait_topic
+        WHERE
+            trait_topic.name = %(topic)s OR
+            %(topic)s::TEXT IS NULL
+    )
+ORDER BY
+    position DESC,
+    trait_name ASC
+"""
+
+# Reactivation/sign-in metadata bumps shared by `/check-otp` and the
+# social sign-in flow: marks the user activated and bumps
+# `sign_in_count` / `sign_in_time`. Reactivation ripples to
+# `person_club.activated` and the clubs' `count_members` via triggers.
+#
+# Caller must define `existing_person_before_update` first as a CTE
+# yielding `(id)` with zero or one rows.
+_Q_POST_SIGN_IN_CTES = f"""
+existing_person AS (
+    UPDATE
+        person
+    SET
+        activated = TRUE,
+        sign_in_count = sign_in_count + 1,
+        sign_in_time = NOW()
+    WHERE
+        id = (SELECT id FROM existing_person_before_update)
+    RETURNING
+        person.id,
+        person.uuid AS person_uuid,
+        person.unit_id,
+        person.name,
+        person.sign_up_time,
+        person.count_answers,
+        {has_gold_sql('person.id')} AS has_gold
+)
+"""
+
+# OTP-issuing CTE chain. The ban check is intentionally NOT here: the
+# OTP and social paths share `Q_IS_BANNED` for that and run it as an
+# explicit step in the same transaction, which keeps both endpoints
+# following the same control flow.
+_OTP_CTE = f"""
+WITH random_otp AS (
+    SELECT LPAD(FLOOR(RANDOM() * (10e5 + 1))::TEXT, 6, '0') AS otp
+), zero_otp AS (
+    SELECT '000000' AS otp
+), is_registered AS (
+    SELECT 1 WHERE     {Q_IS_REGISTERED_BY_NORMALIZED_EMAIL}
+), is_unregistered AS (
+    SELECT 1 WHERE NOT {Q_IS_REGISTERED_BY_NORMALIZED_EMAIL}
+), domain AS (
+    SELECT
+        SUBSTRING(%(email)s FROM POSITION('@' IN %(email)s) + 1) AS domain
+), otp AS (
+    SELECT
+        CASE
+        WHEN
+                EXISTS (SELECT 1 FROM domain WHERE domain = 'example.com')
+            AND
+                EXISTS (SELECT 1 FROM is_registered)
+            OR
+                EXISTS (SELECT 1 FROM domain WHERE domain = 'example.com')
+            AND
+                %(is_dev)s
+        THEN
+            (SELECT otp FROM zero_otp)
+        ELSE
+            (SELECT otp FROM random_otp)
+        END AS otp
+    WHERE
+        NOT EXISTS (
+            SELECT
+                1
+            FROM
+                bad_email_domain
+            JOIN
+                domain
+            ON
+                domain.domain = bad_email_domain.domain
+            JOIN
+                is_unregistered
+            ON
+                TRUE
+        )
+)
+"""
+
+Q_INSERT_DUO_SESSION = f"""
+{_OTP_CTE}
+INSERT INTO duo_session (
+    session_token_hash,
+    person_id,
+    email,
+    pending_club_name,
+    ref,
+    otp,
+    ip_address,
+    answers,
+    asns
+)
+SELECT
+    %(session_token_hash)s,
+    (
+        SELECT
+            id
+        FROM
+            person
+        WHERE
+            normalized_email = %(normalized_email)s
+        ORDER BY
+            email = %(email)s DESC,
+            email
+        LIMIT 1
+    ),
+    %(email)s,
+    %(pending_club_name)s,
+    %(ref)s,
+    otp,
+    %(ip_address)s,
+    %(answers)s::jsonb,
+    %(asns)s::bigint[]
+FROM
+    otp
+RETURNING
+    otp
+"""
+
+Q_UPDATE_OTP = f"""
+{_OTP_CTE}
+UPDATE
+    duo_session
+SET
+    otp = otp.otp,
+    otp_expiry = NOW() + INTERVAL '10 minutes'
+FROM
+    otp
+WHERE
+    session_token_hash = %(session_token_hash)s
+RETURNING
+    otp.otp
+"""
+
+Q_MAYBE_DELETE_ONBOARDEE = """
+WITH valid_session AS (
+    UPDATE duo_session
+    SET signed_in = TRUE
+    WHERE
+        session_token_hash = %(session_token_hash)s AND
+        otp = %(otp)s AND
+        otp_expiry > NOW()
+    RETURNING email
+)
+DELETE FROM onboardee
+WHERE email IN (SELECT email FROM valid_session)
+RETURNING email
+"""
+
+Q_MAYBE_SIGN_IN = f"""
+WITH valid_session AS (
+    UPDATE
+        duo_session
+    SET
+        signed_in = TRUE
+    WHERE
+        session_token_hash = %(session_token_hash)s
+    AND
+        otp = %(otp)s
+    AND
+        otp_expiry > NOW()
+    AND NOT EXISTS (
+        SELECT
+            1
+        FROM
+            person
+        WHERE
+            person.id = duo_session.person_id
+        AND
+            'bot' = ANY(person.roles)
+    )
+    RETURNING
+        person_id,
+        email
+), existing_person_before_update AS (
+    SELECT
+        id
+    FROM
+        person
+    WHERE
+        id = (SELECT person_id FROM valid_session)
+), {_Q_POST_SIGN_IN_CTES}, new_onboardee AS (
+    INSERT INTO onboardee (
+        email
+    )
+    SELECT
+        email
+    FROM
+        valid_session
+    WHERE NOT EXISTS (SELECT 1 FROM existing_person)
+)
+SELECT
+    person_id,
+    person_uuid,
+    has_gold,
+    (SELECT name FROM unit WHERE id = existing_person.unit_id) AS units,
+    {_Q_DO_SHOW_DONATION_NAG.format(table='existing_person')},
+    {_Q_ESTIMATED_END_DATE},
+    existing_person.name AS name
+FROM
+    valid_session
+LEFT JOIN
+    existing_person
+ON
+    valid_session.person_id = existing_person.id
+"""
+
+Q_PERSON_AGE = """
+SELECT
+    EXTRACT(YEAR FROM AGE(date_of_birth))::INT AS age
+FROM
+    person
+WHERE
+    id = %(person_id)s
+"""
+
+Q_COUNT_NEARBY_CANDIDATES = """
+SELECT
+    count(*) AS candidates
+FROM (
+    SELECT
+        1
+    FROM
+        person AS prospect
+    JOIN
+        person AS subject
+    ON
+        subject.id = %(person_id)s
+    JOIN
+        search_preference AS subject_preference
+    ON
+        subject_preference.person_id = subject.id
+    WHERE
+        prospect.activated
+    AND
+        (
+            NOT %(same_country_only)s
+        OR
+            prospect.location_country = subject.location_country
+        )
+    AND
+        prospect.gender_id = ANY(subject_preference.gender_ids)
+    AND
+        EXISTS (
+            SELECT 1
+            FROM search_preference AS prospect_preference
+            WHERE
+                prospect_preference.person_id = prospect.id
+            AND
+                subject.gender_id = ANY(prospect_preference.gender_ids)
+        )
+    AND
+        ST_DWithin(
+            prospect.coordinates,
+            subject.coordinates,
+            %(distance_metres)s
+        )
+    AND
+        prospect.date_of_birth <= (
+            CURRENT_DATE - INTERVAL '1 year' * %(min_age)s
+        )
+    AND
+        prospect.date_of_birth > (
+            CURRENT_DATE - INTERVAL '1 year' * (%(max_age)s + 1)
+        )
+    LIMIT
+        %(candidate_limit)s
+) AS candidate
+"""
+
+Q_IS_JOINING_CLUB = """
+SELECT
+    EXISTS (
+        SELECT 1
+        FROM duo_session
+        WHERE person_id = %(person_id)s
+        AND pending_club_name IS NOT NULL
+    ) AS is_joining_club
+"""
+
+Q_UPDATE_BEST_SEARCH_PREFERENCES = """
+UPDATE
+    search_preference
+SET
+    min_age = %(min_age)s,
+    max_age = %(max_age)s,
+    distance = %(distance)s::NUMERIC::SMALLINT,
+    same_country_only = %(same_country_only)s
+WHERE
+    person_id = %(person_id)s
+"""
+
+Q_FINISH_ONBOARDING = f"""
+WITH onboardee_location AS (
+    SELECT
+        short_friendly,
+        long_friendly,
+        country,
+        verification_required
+    FROM
+        location
+    ORDER BY coordinates <-> (
+        SELECT coordinates
+        FROM onboardee
+        WHERE email = %(email)s
+    )
+    LIMIT 1
+), new_person AS (
+    INSERT INTO person (
+        email,
+        normalized_email,
+        name,
+        url_slug,
+        date_of_birth,
+        coordinates,
+        gender_id,
+        about,
+        has_profile_picture_id,
+        unit_id,
+        intros_notification,
+        verification_required,
+        location_short_friendly,
+        location_long_friendly,
+        location_country
+    ) SELECT
+        email,
+        %(normalized_email)s,
+        name,
+        url_slug,
+        date_of_birth,
+        coordinates,
+        gender_id,
+        COALESCE(about, ''),
+        2 AS has_profile_picture_id,
+        (
+            SELECT id
+            FROM unit
+            WHERE name IN (
+                CASE
+                    WHEN country IN ('United States', 'United Kingdom')
+                    THEN 'Imperial'
+                    ELSE 'Metric'
+                END
+            )
+        ) AS unit_id,
+        2 AS intros_notification,
+        verification_required,
+        short_friendly,
+        long_friendly,
+        country
+    FROM
+        onboardee,
+        onboardee_location
+    WHERE email = %(email)s
+    RETURNING
+        id,
+        person.uuid,
+        url_slug,
+        email,
+        unit_id,
+        coordinates,
+        date_of_birth,
+        person.name
+), updated_session AS (
+    UPDATE duo_session
+    SET person_id = new_person.id
+    FROM new_person
+    WHERE duo_session.email = new_person.email
+), inserted_search_preference AS (
+    INSERT INTO search_preference (
+        person_id,
+        gender_ids,
+        orientation_ids,
+        ethnicity_ids,
+        body_type_ids,
+        has_profile_picture_ids,
+        looking_for_ids,
+        smoking_ids,
+        drinking_ids,
+        drugs_ids,
+        long_distance_ids,
+        relationship_status_ids,
+        has_kids_ids,
+        wants_kids_ids,
+        exercise_ids,
+        religion_ids,
+        star_sign_ids,
+        last_online_id,
+        sort_by_id,
+        show_messaged,
+        show_skipped
+    )
+    SELECT
+        new_person.id,
+        ARRAY(
+            SELECT gender_id
+            FROM onboardee_search_preference_gender
+            WHERE email = new_person.email
+            ORDER BY gender_id
+        ),
+        ARRAY(SELECT id FROM orientation ORDER BY id),
+        ARRAY(SELECT id FROM ethnicity ORDER BY id),
+        ARRAY(SELECT id FROM body_type ORDER BY id),
+        ARRAY(SELECT id FROM yes_no ORDER BY id),
+        ARRAY(SELECT id FROM looking_for ORDER BY id),
+        ARRAY(SELECT id FROM yes_no_optional ORDER BY id),
+        ARRAY(SELECT id FROM frequency ORDER BY id),
+        ARRAY(SELECT id FROM yes_no_optional ORDER BY id),
+        ARRAY(SELECT id FROM yes_no_optional ORDER BY id),
+        ARRAY(SELECT id FROM relationship_status ORDER BY id),
+        ARRAY(SELECT id FROM yes_no_optional ORDER BY id),
+        ARRAY(SELECT id FROM yes_no_maybe ORDER BY id),
+        ARRAY(SELECT id FROM frequency ORDER BY id),
+        ARRAY(SELECT id FROM religion ORDER BY id),
+        ARRAY(SELECT id FROM star_sign ORDER BY id),
+        (SELECT id FROM last_online WHERE name = '{LAST_ONLINE_DEFAULT_NAME}'),
+        (SELECT id from sort_by where name = '{SORT_MATCH_PERCENTAGE}'),
+        TRUE,
+        FALSE
+    FROM new_person
+), deleted_onboardee AS (
+    DELETE FROM onboardee
+    WHERE email = %(email)s
+)
+SELECT
+    new_person.id AS person_id,
+    new_person.uuid AS person_uuid,
+    new_person.url_slug,
+    (SELECT name FROM unit WHERE unit.id = new_person.unit_id) AS units,
+    false AS do_show_donation_nag,
+    {_Q_ESTIMATED_END_DATE},
+    new_person.name AS name
+FROM
+    new_person
+"""
+
+Q_SELECT_PROSPECT_PROFILE = f"""
+WITH prospect_base AS (
+    SELECT *
+    FROM person AS prospect
+    WHERE
+        (
+            uuid = uuid_or_null(%(prospect_handle)s::TEXT)
+        OR
+            -- Slugs are always minted lower-case, so match exactly: a
+            -- mixed-case handle resolves only as a uuid, never a slug. This
+            -- keeps the canonical profile URL lower-case and matches the
+            -- frontend's lower-case-only slug route.
+            url_slug = %(prospect_handle)s
+        )
+    AND
+        activated
+    -- The OR lets the planner BitmapOr the uuid and url_slug indexes (a CASE
+    -- here would hide both from it). A handle can in principle match two rows
+    -- (a uuid for one person, a url_slug for another); prefer the exact-uuid
+    -- match so a uuid handle always resolves to its owner, and LIMIT to one.
+    ORDER BY
+        (uuid = uuid_or_null(%(prospect_handle)s::TEXT)) DESC NULLS LAST
+    LIMIT 1
+), viewer_rel AS MATERIALIZED (
+    -- Tiny (one row, two booleans). MATERIALIZED so the planner evaluates
+    -- these as single-row index probes on (subject_person_id,
+    -- object_person_id). Without the barrier the planner inlines the CTE and
+    -- pulls the EXISTS clauses into the visibility filter's OR/NOT branches,
+    -- where it can only express them as hashed subplans that scan *every* row
+    -- targeting the viewer - so the cost grows with how many people have
+    -- messaged or skipped the viewer.
+    SELECT
+        EXISTS (
+            SELECT 1 FROM messaged
+            WHERE messaged.subject_person_id = prospect_base.id
+              AND messaged.object_person_id  = %(person_id)s
+        ) AS prospect_has_messaged_person,
+        EXISTS (
+            SELECT 1 FROM skipped
+            WHERE skipped.subject_person_id = prospect_base.id
+              AND skipped.object_person_id  = %(person_id)s
+        ) AS prospect_skipped_person
+    FROM prospect_base
+), prospect AS (
+    SELECT
+        prospect.*,
+
+        (
+            SELECT EXTRACT(YEAR FROM AGE(prospect.date_of_birth))::SMALLINT
+            WHERE prospect.show_my_age
+        ) AS age,
+
+        CASE show_my_location.name
+            WHEN 'Yes' THEN prospect.location_short_friendly
+            WHEN 'Country only' THEN prospect.location_country
+            ELSE NULL
+        END AS location,
+
+        (
+            SELECT ROUND(EXTRACT(EPOCH FROM NOW() - prospect.last_online_time))
+            WHERE prospect.show_my_online_status
+        ) AS seconds_since_last_online,
+
+        (
+            ROUND(EXTRACT(EPOCH FROM NOW() - sign_up_time))
+        ) AS seconds_since_sign_up,
+
+        (
+            SELECT ROUND(
+                prospect.count_intros_sent_with_reply::numeric /
+                prospect.count_intros_sent * 100,
+                1)
+            WHERE %(person_id)s IS NOT NULL
+            AND prospect.sign_up_time <= NOW() - interval '1 day'
+            AND prospect.count_intros_sent >= 5
+        ) AS gets_reply_percentage,
+
+        (
+            SELECT ROUND(
+                prospect.count_intros_received_with_reply::numeric /
+                prospect.count_intros_received * 100,
+                1)
+            WHERE %(person_id)s IS NOT NULL
+            AND prospect.sign_up_time <= NOW() - interval '1 day'
+            AND prospect.count_intros_received >= 5
+        ) AS gives_reply_percentage,
+
+        viewer_rel.prospect_has_messaged_person
+    FROM
+        prospect_base AS prospect
+    JOIN
+        yes_country_only_no AS show_my_location
+    ON
+        show_my_location.id = prospect.show_my_location_id
+    CROSS JOIN
+        viewer_rel
+    WHERE
+        -- Signed-in viewer: gated by hide_me_from_strangers, verification
+        -- level, and skipped status.
+        (
+            %(person_id)s IS NOT NULL
+        AND (
+                NOT prospect.hide_me_from_strangers
+            OR
+                prospect.public_profile
+            OR
+                viewer_rel.prospect_has_messaged_person
+        )
+        AND (
+            prospect.privacy_verification_level_id <= (
+                SELECT
+                    verification_level_id
+                FROM
+                    person
+                WHERE
+                    id = %(person_id)s
+            )
+            OR
+                viewer_rel.prospect_has_messaged_person
+        )
+        AND
+            NOT viewer_rel.prospect_skipped_person
+        )
+        OR
+        -- Anonymous viewer: only when the prospect has opted in to
+        -- `public_profile`. `public_profile` overrides
+        -- `hide_me_from_strangers` and `privacy_verification_level_id`.
+        (
+            %(person_id)s IS NULL
+        AND
+            prospect.public_profile
+        )
+        OR
+        -- Self-view.
+        prospect.id = %(person_id)s
+), updated_visited AS (
+    INSERT INTO visited (
+        subject_person_id,
+        object_person_id,
+        updated_at,
+        invisible
+    )
+    SELECT
+        %(person_id)s AS subject_person_id,
+        prospect.id AS object_person_id,
+        now() AS updated_at,
+        (
+            SELECT
+                person.browse_invisibly OR
+                person.hide_me_from_strangers AND
+                NOT person.public_profile AND
+                NOT prospect_has_messaged_person
+            FROM
+                person
+            WHERE
+                id = %(person_id)s
+        ) AS invisible
+    FROM
+        prospect
+    -- `visited.subject_person_id` is NOT NULL, so anonymous viewers can't
+    -- record a visit.
+    WHERE
+        %(person_id)s IS NOT NULL
+    ON CONFLICT (subject_person_id, object_person_id) DO UPDATE SET
+        updated_at = now(),
+        invisible = EXCLUDED.invisible
+), negative_dot_prod AS (
+    -- Empty for anonymous viewers, so `match_percentage` is NULL and the
+    -- frontend hides the donut. Without the guard, `CLAMP(0, 99, NULL)`
+    -- would coerce to 0 (`GREATEST(0, NULL) = 0`), misrepresenting itself
+    -- as a genuine 0 percent match.
+    SELECT (
+        SELECT personality FROM person WHERE id = %(person_id)s
+    ) <#> (
+        SELECT personality FROM prospect
+    ) AS negative_dot_prod
+    WHERE %(person_id)s IS NOT NULL
+), match_percentage AS (
+    SELECT
+        CLAMP(
+            0,
+            99,
+            100 * (1 - negative_dot_prod.negative_dot_prod) / 2
+        )::SMALLINT AS j
+    FROM
+        negative_dot_prod
+), photos AS (
+    SELECT
+        COALESCE(json_agg(photo.uuid       ORDER BY position), '[]'::json) AS uuids,
+        COALESCE(json_agg(photo.extra_exts ORDER BY position), '[]'::json) AS extra_exts,
+        COALESCE(json_agg(photo.blurhash   ORDER BY position), '[]'::json) AS blurhashes,
+        COALESCE(json_agg(photo.verified   ORDER BY position), '[]'::json) AS verifications,
+        COALESCE(json_agg(({PHOTO_GEOMETRY}) ORDER BY position), '[]'::json) AS geometries
+    FROM photo
+    JOIN prospect
+    ON   prospect.id = photo.person_id
+), audio_bio_uuid AS (
+    SELECT audio.uuid AS j
+    FROM   audio
+    JOIN   prospect
+    ON     prospect.id = audio.person_id
+    WHERE  audio.position = -1
+), gender AS (
+    SELECT gender.name AS j
+    FROM gender JOIN prospect ON gender_id = gender.id
+    WHERE gender.name != 'Unanswered'
+), orientation AS (
+    SELECT orientation.name AS j
+    FROM orientation JOIN prospect ON orientation_id = orientation.id
+    WHERE orientation.name != 'Unanswered'
+), ethnicity AS (
+    SELECT ethnicity.name AS j
+    FROM ethnicity JOIN prospect ON ethnicity_id = ethnicity.id
+    WHERE ethnicity.name != 'Unanswered'
+), body_type AS (
+    SELECT body_type.name AS j
+    FROM body_type JOIN prospect ON body_type_id = body_type.id
+    WHERE body_type.name != 'Unanswered'
+), looking_for AS (
+    SELECT
+        COALESCE(
+            array_agg(looking_for.name ORDER BY looking_for.id),
+            ARRAY[]::TEXT[]
+        ) AS j
+    FROM looking_for JOIN prospect ON looking_for.id = ANY(looking_for_ids)
+    WHERE looking_for.name != 'Unanswered'
+    AND prospect.show_my_looking_for
+), smoking AS (
+    SELECT yes_no_optional.name AS j
+    FROM yes_no_optional JOIN prospect ON smoking_id = yes_no_optional.id
+    WHERE yes_no_optional.name != 'Unanswered'
+), drinking AS (
+    SELECT frequency.name AS j
+    FROM frequency JOIN prospect ON drinking_id = frequency.id
+    WHERE frequency.name != 'Unanswered'
+), drugs AS (
+    SELECT yes_no_optional.name AS j
+    FROM yes_no_optional JOIN prospect ON drugs_id = yes_no_optional.id
+    WHERE yes_no_optional.name != 'Unanswered'
+), long_distance AS (
+    SELECT yes_no_optional.name AS j
+    FROM yes_no_optional JOIN prospect ON long_distance_id = yes_no_optional.id
+    WHERE yes_no_optional.name != 'Unanswered'
+    AND prospect.show_my_looking_for
+), relationship_status AS (
+    SELECT relationship_status.name AS j
+    FROM relationship_status JOIN prospect ON relationship_status_id = relationship_status.id
+    WHERE relationship_status.name != 'Unanswered'
+), has_kids AS (
+    SELECT yes_no_maybe.name AS j
+    FROM yes_no_maybe JOIN prospect ON has_kids_id = yes_no_maybe.id
+    WHERE yes_no_maybe.name != 'Unanswered'
+), wants_kids AS (
+    SELECT yes_no_maybe.name AS j
+    FROM yes_no_maybe JOIN prospect ON wants_kids_id = yes_no_maybe.id
+    WHERE yes_no_maybe.name != 'Unanswered'
+), exercise AS (
+    SELECT frequency.name AS j
+    FROM frequency JOIN prospect ON exercise_id = frequency.id
+    WHERE frequency.name != 'Unanswered'
+), religion AS (
+    SELECT religion.name AS j
+    FROM religion JOIN prospect ON religion_id = religion.id
+    WHERE religion.name != 'Unanswered'
+), star_sign AS (
+    SELECT star_sign.name AS j
+    FROM star_sign JOIN prospect ON star_sign_id = star_sign.id
+    WHERE star_sign.name != 'Unanswered'
+), pref_gender AS (
+    SELECT COALESCE(array_agg(g.name ORDER BY g.id), ARRAY[]::TEXT[]) AS j
+    FROM public.gender AS g, search_preference
+    WHERE search_preference.person_id = (SELECT id FROM prospect)
+    AND g.id = ANY(search_preference.gender_ids)
+    AND (SELECT show_my_looking_for FROM prospect)
+), pref_age AS (
+    SELECT json_build_object(
+        'min_age', min_age,
+        'max_age', max_age
+    ) AS j
+    FROM search_preference
+    WHERE person_id = (SELECT id FROM prospect)
+    AND (SELECT show_my_looking_for FROM prospect)
+), is_skipped AS (
+    SELECT
+        EXISTS (
+            SELECT 1
+            FROM skipped
+            WHERE
+                subject_person_id = %(person_id)s AND
+                object_person_id  = (SELECT id FROM prospect)
+        ) AS j
+), advertiser_friendly AS (
+    -- Ads have been removed; this is kept as a constant so existing native
+    -- clients (which validate this field) keep working without the DB spending
+    -- time computing it.
+    SELECT FALSE AS j
+), clubs AS (
+    SELECT
+        prospect_person_club.club_name,
+        person_club_.person_id IS NOT NULL AS is_mutual
+    FROM
+        person_club AS prospect_person_club
+    LEFT JOIN
+        person_club AS person_club_
+    ON
+        prospect_person_club.club_name = person_club_.club_name
+    AND
+        person_club_.person_id = %(person_id)s
+    WHERE
+        prospect_person_club.person_id = (SELECT id FROM prospect)
+    ORDER BY
+        is_mutual DESC,
+        club_name
+), mutual_clubs_json AS (
+    SELECT COALESCE(
+        json_agg(
+            club_name
+            ORDER BY
+                is_mutual DESC,
+                club_name
+        ),
+        '[]'::json
+    ) AS j
+    FROM clubs
+    WHERE is_mutual
+), other_clubs_json AS (
+    SELECT COALESCE(
+        json_agg(
+            club_name
+            ORDER BY
+                is_mutual DESC,
+                club_name
+        ),
+        '[]'::json
+    ) AS j
+    FROM clubs
+    WHERE NOT is_mutual
+), spotify_artists_json AS (
+    SELECT
+        COALESCE(
+            (
+                SELECT top_artists
+                FROM person_spotify
+                WHERE person_id = (SELECT id FROM prospect)
+            ),
+            '[]'::jsonb
+        ) AS j
+), flair AS (
+    SELECT
+        ({computed_flair_sql('prospect')}) AS computed_flair
+    FROM
+        prospect
+)
+SELECT
+    json_build_object(
+        'person_id',                 (SELECT id                        FROM prospect),
+        'person_uuid',               (SELECT uuid                      FROM prospect),
+        'photo_uuids',               (SELECT uuids                     FROM photos),
+        'photo_extra_exts',          (SELECT extra_exts                FROM photos),
+        'photo_blurhashes',          (SELECT blurhashes                FROM photos),
+        'photo_verifications',       (SELECT verifications             FROM photos),
+        'photo_geometries',          (SELECT geometries                FROM photos),
+        'audio_bio_uuid',            (SELECT j                         FROM audio_bio_uuid),
+        'name',                      (SELECT name                      FROM prospect),
+        'url_slug',                  (SELECT url_slug                  FROM prospect),
+        'age',                       (SELECT age                       FROM prospect),
+        'location',                  (SELECT location                  FROM prospect),
+        'match_percentage',          (SELECT j                         FROM match_percentage),
+        'about',                     (SELECT about                     FROM prospect),
+        'count_answers',             (SELECT count_answers             FROM prospect),
+        'is_skipped',                (SELECT j                         FROM is_skipped),
+        'advertiser_friendly',       (SELECT j                         FROM advertiser_friendly),
+        'seconds_since_last_online', (SELECT seconds_since_last_online FROM prospect),
+        'seconds_since_sign_up',     (SELECT seconds_since_sign_up     FROM prospect),
+        'gets_reply_percentage',     (SELECT gets_reply_percentage     FROM prospect),
+        'gives_reply_percentage',    (SELECT gives_reply_percentage    FROM prospect),
+        'flair',                     (SELECT computed_flair            FROM flair),
+
+        -- Basics
+        'occupation',             (SELECT occupation    FROM prospect),
+        'education',              (SELECT education     FROM prospect),
+        'height_cm',              (SELECT height_cm     FROM prospect),
+        'gender',                 (SELECT j             FROM gender),
+        'orientation',            (SELECT j             FROM orientation),
+        'ethnicity',              (SELECT j             FROM ethnicity),
+        'body_type',              (SELECT j             FROM body_type),
+        'looking_for',            (SELECT j             FROM looking_for),
+        'smoking',                (SELECT j             FROM smoking),
+        'drinking',               (SELECT j             FROM drinking),
+        'drugs',                  (SELECT j             FROM drugs),
+        'long_distance',          (SELECT j             FROM long_distance),
+        'relationship_status',    (SELECT j             FROM relationship_status),
+        'has_kids',               (SELECT j             FROM has_kids),
+        'wants_kids',             (SELECT j             FROM wants_kids),
+        'exercise',               (SELECT j             FROM exercise),
+        'religion',               (SELECT j             FROM religion),
+        'star_sign',              (SELECT j             FROM star_sign),
+        'gender_preference',      (SELECT j             FROM pref_gender),
+        'age_preference',         (SELECT j             FROM pref_age),
+        'show_my_looking_for',    (SELECT CASE WHEN show_my_looking_for THEN 'Yes' ELSE 'No' END FROM prospect),
+
+        -- Clubs
+        'mutual_clubs',           (SELECT j             FROM mutual_clubs_json),
+        'other_clubs',            (SELECT j             FROM other_clubs_json),
+
+        -- Music
+        'spotify_artists',        (SELECT j             FROM spotify_artists_json),
+
+        -- Verifications
+        'verified_age',           (SELECT verified_age       FROM prospect),
+        'verified_gender',        (SELECT verified_gender    FROM prospect),
+        'verified_ethnicity',     (SELECT verified_ethnicity FROM prospect),
+
+        -- Theme
+        'theme', json_build_object(
+            'title_color',         (SELECT title_color      FROM prospect),
+            'body_color',          (SELECT body_color       FROM prospect),
+            'background_color',    (SELECT background_color FROM prospect)
+        )
+    ) AS j,
+    (SELECT id   FROM prospect) AS prospect_id,
+    (SELECT uuid FROM prospect) AS prospect_uuid
+WHERE
+    EXISTS (SELECT 1 FROM prospect)
+"""
+
+# Slim variant of `Q_SELECT_PROSPECT_PROFILE` for the chat header. Returns just
+# the fields the conversation screen renders (name, primary photo, skipped
+# state) and deliberately does NOT write to `visited` — opening someone's
+# chat is not the same as viewing their profile, so it shouldn't surface them
+# in the prospect's "Visitors" tab.
+Q_SELECT_CONVERSATION_PROSPECT = """
+WITH prospect AS (
+    SELECT
+        person.id,
+        person.uuid,
+        person.name,
+        person.url_slug
+    FROM
+        person
+    LEFT JOIN LATERAL (
+        SELECT
+            EXISTS (
+                SELECT 1
+                FROM messaged
+                WHERE
+                    messaged.subject_person_id = person.id
+                AND
+                    messaged.object_person_id = %(person_id)s
+            ) AS prospect_has_messaged_person
+    ) AS m
+    ON
+        TRUE
+    WHERE
+        (
+            uuid = uuid_or_null(%(prospect_handle)s::TEXT)
+        OR
+            url_slug = %(prospect_handle)s
+        )
+    AND
+        activated
+    AND (
+        (
+            person.shadow_banned_at IS NULL
+        AND (
+                NOT person.hide_me_from_strangers
+            OR
+                person.public_profile
+            OR
+                m.prospect_has_messaged_person
+            )
+        AND (
+                person.privacy_verification_level_id <= (
+                    SELECT verification_level_id
+                    FROM person AS viewer
+                    WHERE viewer.id = %(person_id)s
+                )
+            OR
+                m.prospect_has_messaged_person
+        )
+        AND
+            NOT EXISTS (
+                SELECT 1
+                FROM skipped
+                WHERE
+                    subject_person_id = person.id AND
+                    object_person_id  = %(person_id)s
+            )
+        )
+        OR
+            person.id = %(person_id)s
+    )
+    ORDER BY
+        (uuid = uuid_or_null(%(prospect_handle)s::TEXT)) DESC NULLS LAST
+    LIMIT 1
+), primary_photo AS (
+    SELECT
+        photo.uuid AS photo_uuid,
+        photo.blurhash AS photo_blurhash
+    FROM
+        photo
+    JOIN
+        prospect ON prospect.id = photo.person_id
+    ORDER BY
+        photo.position
+    LIMIT 1
+), is_skipped AS (
+    SELECT
+        EXISTS (
+            SELECT 1
+            FROM skipped
+            WHERE
+                subject_person_id = %(person_id)s AND
+                object_person_id  = (SELECT id FROM prospect)
+        ) AS j
+)
+SELECT
+    json_build_object(
+        -- `is_available` is always `true` for a 200 response: the `prospect`
+        -- CTE filters out deactivated, hidden, and prospect-skipped-viewer
+        -- cases, which surface as 404. Returning the field explicitly (rather
+        -- than letting clients infer availability from `name IS NULL`)
+        -- decouples "should the name render?" from "is this conversation
+        -- actionable?" so future cases (e.g. temporarily-deactivated accounts
+        -- where we still want to render the name) can diverge cleanly.
+        'is_available',   true,
+        'person_uuid',    (SELECT uuid           FROM prospect),
+        'name',           (SELECT name           FROM prospect),
+        'url_slug',       (SELECT url_slug       FROM prospect),
+        'photo_uuid',     (SELECT photo_uuid     FROM primary_photo),
+        'photo_blurhash', (SELECT photo_blurhash FROM primary_photo),
+        'is_skipped',     (SELECT j              FROM is_skipped)
+    ) AS j
+WHERE
+    EXISTS (SELECT 1 FROM prospect)
+"""
+
+Q_CHECK_SESSION_TOKEN = f"""
+SELECT
+    name,
+    {has_gold_sql('person.id')} AS has_gold,
+    {_Q_DO_SHOW_DONATION_NAG.format(table='person')},
+    {_Q_ESTIMATED_END_DATE},
+    (SELECT name FROM unit WHERE unit.id = person.unit_id) AS units
+FROM
+    person
+WHERE
+    id = %(person_id)s
+"""
+
+Q_DELETE_SKIPPED_BY_UUID = """
+DELETE FROM
+    skipped
+USING
+    person
+WHERE
+    person.id = skipped.object_person_id
+AND
+    person.uuid = uuid_or_null(%(prospect_uuid)s)
+AND
+    subject_person_id = %(subject_person_id)s
+"""
+
+Q_ANSWER_COMPARISON = """
+WITH prospect_name AS(
+    SELECT name FROM person WHERE id = %(prospect_person_id)s
+), person_name AS(
+    SELECT name FROM person WHERE id = %(person_id)s
+)
+SELECT
+    prospect_answer.person_id AS prospect_person_id,
+    (SELECT name FROM prospect_name) AS prospect_name,
+    prospect_answer.answer AS prospect_answer,
+    person_answer.person_id AS person_id,
+    (SELECT name FROM person_name) AS person_name,
+    person_answer.answer AS person_answer,
+    person_answer.public_ AS person_public_,
+    question.id AS question_id,
+    question.question AS question,
+    question.topic AS topic
+FROM (
+    SELECT
+        person_id,
+        question_id,
+        answer.answer
+    FROM
+        answer
+    JOIN
+        question ON
+        question.id = answer.question_id AND
+        (question.topic = %(topic)s OR %(topic)s = 'All') AND
+        answer.person_id = %(prospect_person_id)s AND
+        answer.public_ = TRUE AND
+        answer.answer IS NOT NULL AND
+        (
+            %(prospect_person_id)s = %(person_id)s OR
+            NOT EXISTS (
+                SELECT 1 FROM person
+                WHERE id = %(prospect_person_id)s AND shadow_banned_at IS NOT NULL
+            )
+        )
+) AS prospect_answer
+JOIN
+    question ON
+    question.id = prospect_answer.question_id
+LEFT JOIN
+    answer AS person_answer ON
+    person_answer.person_id = %(person_id)s AND
+    person_answer.question_id = prospect_answer.question_id
+WHERE
+    (
+        %(agreement)s != 'Agree' OR
+        person_answer.answer IS NOT NULL AND
+        prospect_answer.answer IS NOT NULL AND
+        person_answer.answer = prospect_answer.answer
+    ) AND (
+        %(agreement)s != 'Disagree' OR
+        person_answer.answer IS NOT NULL AND
+        prospect_answer.answer IS NOT NULL AND
+        person_answer.answer != prospect_answer.answer
+    ) AND (
+        %(agreement)s != 'Unanswered' OR
+        person_answer.answer IS NULL
+    )
+ORDER BY
+    question.id
+LIMIT %(n)s
+OFFSET %(o)s
+"""
+
+Q_SELECT_SESSION_TOKEN_HASHES_BY_PERSON_ID = """
+SELECT
+    session_token_hash
+FROM
+    duo_session
+WHERE
+    person_id = ANY(%(person_ids)s)
+"""
+
+Q_DELETE_ACCOUNT = """
+WITH deleted_inbox AS (
+    DELETE FROM inbox
+    WHERE luser = %(person_uuid)s
+), deleted_mam_message AS (
+    DELETE FROM mam_message
+    WHERE person_id = %(person_id)s
+    RETURNING audio_uuid
+), deleted_photo AS (
+    SELECT
+        uuid
+    FROM
+        photo
+    WHERE
+        person_id = %(person_id)s
+), deleted_audio AS (
+    SELECT
+        uuid
+    FROM
+        audio
+    WHERE
+        person_id = %(person_id)s
+), deleted_verification_photo AS (
+    SELECT
+        photo_uuid AS uuid
+    FROM
+        verification_job
+    WHERE
+        person_id = %(person_id)s
+), every_deleted_photo_uuid AS (
+    SELECT uuid FROM deleted_photo
+    UNION
+    SELECT uuid FROM deleted_verification_photo
+), every_deleted_audio_uuid AS (
+    SELECT uuid FROM deleted_audio
+
+    UNION
+
+    SELECT
+        deleted_mam_message.audio_uuid AS uuid
+    FROM
+        deleted_mam_message
+    LEFT JOIN
+        mam_message
+    ON
+        mam_message.audio_uuid = deleted_mam_message.audio_uuid
+    AND
+        mam_message.person_id <> %(person_id)s
+    WHERE
+        deleted_mam_message.audio_uuid IS NOT NULL
+    AND
+        mam_message.audio_uuid IS NULL
+), deleted_person AS (
+    DELETE FROM
+        person
+    WHERE
+        id = %(person_id)s
+), undeleted_photo_insertion AS (
+    INSERT INTO undeleted_photo (
+        uuid
+    )
+    SELECT
+        uuid
+    FROM
+        every_deleted_photo_uuid
+), undeleted_audio_insertion AS (
+    INSERT INTO undeleted_audio (
+        uuid
+    )
+    SELECT
+        uuid
+    FROM
+        every_deleted_audio_uuid
+)
+SELECT 1
+"""
+
+Q_POST_DEACTIVATE = """
+WITH updated_person AS (
+    UPDATE
+        person
+    SET
+        activated = FALSE
+    WHERE
+        activated = TRUE
+    AND
+        id = %(person_id)s
+    RETURNING
+        id
+), deleted_duo_session AS (
+    DELETE FROM
+        duo_session
+    WHERE
+        person_id = %(person_id)s
+    RETURNING
+        session_token_hash
+)
+SELECT
+    session_token_hash
+FROM
+    deleted_duo_session
+"""
+
+Q_GET_PROFILE_INFO = f"""
+WITH photo_ AS (
+    SELECT json_object_agg(position, uuid) AS j
+    FROM photo
+    WHERE person_id = %(person_id)s
+), photo_extra_exts AS (
+    SELECT json_object_agg(position, extra_exts) AS j
+    FROM photo
+    WHERE person_id = %(person_id)s
+), photo_blurhash AS (
+    SELECT json_object_agg(position, blurhash) AS j
+    FROM photo
+    WHERE person_id = %(person_id)s
+), photo_verification AS (
+    SELECT json_object_agg(position, verified) AS j
+    FROM photo
+    WHERE person_id = %(person_id)s
+), audio_bio AS (
+    SELECT uuid AS j FROM audio WHERE person_id = %(person_id)s AND position = -1
+), name AS (
+    SELECT name AS j FROM person WHERE id = %(person_id)s
+), url_slug AS (
+    SELECT url_slug AS j FROM person WHERE id = %(person_id)s
+), about AS (
+    SELECT about AS j FROM person WHERE id = %(person_id)s
+), gender AS (
+    SELECT gender.name AS j
+    FROM gender JOIN person ON gender_id = gender.id
+    WHERE person.id = %(person_id)s
+), orientation AS (
+    SELECT orientation.name AS j
+    FROM orientation JOIN person ON orientation_id = orientation.id
+    WHERE person.id = %(person_id)s
+), ethnicity AS (
+    SELECT ethnicity.name AS j
+    FROM ethnicity JOIN person ON ethnicity_id = ethnicity.id
+    WHERE person.id = %(person_id)s
+), location AS (
+    SELECT location_long_friendly AS j
+    FROM person
+    WHERE id = %(person_id)s
+), occupation AS (
+    SELECT occupation AS j FROM person WHERE id = %(person_id)s
+), education AS (
+    SELECT education AS j FROM person WHERE id = %(person_id)s
+), height AS (
+    SELECT height_cm AS j FROM person WHERE id = %(person_id)s
+), body_type AS (
+    SELECT body_type.name AS j
+    FROM body_type JOIN person ON body_type_id = body_type.id
+    WHERE person.id = %(person_id)s
+), looking_for AS (
+    SELECT
+        COALESCE(
+            array_agg(looking_for.name ORDER BY looking_for.id),
+            ARRAY[]::TEXT[]
+        ) AS j
+    FROM looking_for JOIN person ON looking_for.id = ANY(looking_for_ids)
+    WHERE person.id = %(person_id)s
+    AND looking_for.name != 'Unanswered'
+), smoking AS (
+    SELECT yes_no_optional.name AS j
+    FROM yes_no_optional JOIN person ON smoking_id = yes_no_optional.id
+    WHERE person.id = %(person_id)s
+), drinking AS (
+    SELECT frequency.name AS j
+    FROM frequency JOIN person ON drinking_id = frequency.id
+    WHERE person.id = %(person_id)s
+), drugs AS (
+    SELECT yes_no_optional.name AS j
+    FROM yes_no_optional JOIN person ON drugs_id = yes_no_optional.id
+    WHERE person.id = %(person_id)s
+), long_distance AS (
+    SELECT yes_no_optional.name AS j
+    FROM yes_no_optional JOIN person ON long_distance_id = yes_no_optional.id
+    WHERE person.id = %(person_id)s
+), relationship_status AS (
+    SELECT relationship_status.name AS j
+    FROM relationship_status JOIN person ON relationship_status_id = relationship_status.id
+    WHERE person.id = %(person_id)s
+), has_kids AS (
+    SELECT yes_no_maybe.name AS j
+    FROM yes_no_maybe JOIN person ON has_kids_id = yes_no_maybe.id
+    WHERE person.id = %(person_id)s
+), wants_kids AS (
+    SELECT yes_no_maybe.name AS j
+    FROM yes_no_maybe JOIN person ON wants_kids_id = yes_no_maybe.id
+    WHERE person.id = %(person_id)s
+), exercise AS (
+    SELECT frequency.name AS j
+    FROM frequency JOIN person ON exercise_id = frequency.id
+    WHERE person.id = %(person_id)s
+), religion AS (
+    SELECT religion.name AS j
+    FROM religion JOIN person ON religion_id = religion.id
+    WHERE person.id = %(person_id)s
+), star_sign AS (
+    SELECT star_sign.name AS j
+    FROM star_sign JOIN person ON star_sign_id = star_sign.id
+    WHERE person.id = %(person_id)s
+
+), clubs AS (
+    SELECT
+        COALESCE(
+            json_agg(
+                json_build_object(
+                    'name', name,
+                    'count_members', count_members
+                )
+                ORDER BY name
+            ),
+            '[]'::json
+        ) AS j
+    FROM person_club
+    JOIN club ON club.name = club_name
+    WHERE person_id = %(person_id)s
+
+), spotify AS (
+    SELECT
+        top_artists,
+        artists_synced_at IS NOT NULL AS artists_synced
+    FROM person_spotify
+    WHERE person_id = %(person_id)s
+
+), spotify_tester AS (
+    SELECT 'spotify-tester' = ANY(roles) AS j
+    FROM person
+    WHERE id = %(person_id)s
+
+), paypal_subscription AS (
+    SELECT
+        json_build_object(
+            'can_cancel', expires_at = 'infinity',
+            'paid_until', iso8601_utc(expires_at)
+        ) AS j
+    FROM gold_subscription
+    WHERE person_id = %(person_id)s
+    AND provider = 'paypal'
+    AND expires_at > NOW()
+
+), unit AS (
+    SELECT unit.name AS j
+    FROM unit JOIN person ON unit_id = unit.id
+    WHERE person.id = %(person_id)s
+
+), chat AS (
+    SELECT immediacy.name AS j
+    FROM immediacy JOIN person ON chats_notification = immediacy.id
+    WHERE person.id = %(person_id)s
+), intro AS (
+    SELECT immediacy.name AS j
+    FROM immediacy JOIN person ON intros_notification = immediacy.id
+    WHERE person.id = %(person_id)s
+), visitor AS (
+    SELECT immediacy.name AS j
+    FROM immediacy JOIN person ON visitors_notification = immediacy.id
+    WHERE person.id = %(person_id)s
+
+), privacy_verification_level AS (
+    SELECT
+        verification_level.name AS j
+    FROM person
+    JOIN verification_level
+    ON verification_level.id = person.privacy_verification_level_id
+    WHERE person.id = %(person_id)s
+), show_my_location AS (
+    SELECT yes_country_only_no.name AS j
+    FROM person
+    JOIN yes_country_only_no
+    ON yes_country_only_no.id = person.show_my_location_id
+    WHERE person.id = %(person_id)s
+), show_my_online_status AS (
+    SELECT
+        CASE WHEN show_my_online_status THEN 'Yes' ELSE 'No' END AS j
+    FROM person
+    WHERE id = %(person_id)s
+), show_my_age AS (
+    SELECT
+        CASE WHEN show_my_age THEN 'Yes' ELSE 'No' END AS j
+    FROM person
+    WHERE id = %(person_id)s
+), show_my_looking_for AS (
+    SELECT
+        CASE WHEN show_my_looking_for THEN 'Yes' ELSE 'No' END AS j
+    FROM person
+    WHERE id = %(person_id)s
+), hide_me_from_strangers AS (
+    SELECT
+        CASE WHEN hide_me_from_strangers THEN 'Yes' ELSE 'No' END AS j
+    FROM person
+    WHERE id = %(person_id)s
+), browse_invisibly AS (
+    SELECT
+        CASE WHEN browse_invisibly THEN 'Yes' ELSE 'No' END AS j
+    FROM person
+    WHERE id = %(person_id)s
+), public_profile AS (
+    SELECT
+        CASE WHEN public_profile THEN 'Yes' ELSE 'No' END AS j
+    FROM person
+    WHERE id = %(person_id)s
+), verified_gender AS (
+    SELECT verified_gender AS j FROM person WHERE id = %(person_id)s
+), verified_age AS (
+    SELECT verified_age AS j FROM person WHERE id = %(person_id)s
+), verified_ethnicity AS (
+    SELECT verified_ethnicity AS j FROM person WHERE id = %(person_id)s
+), title_color AS (
+    SELECT title_color AS j FROM person WHERE id = %(person_id)s
+), body_color AS (
+    SELECT body_color AS j FROM person WHERE id = %(person_id)s
+), background_color AS (
+    SELECT background_color AS j FROM person WHERE id = %(person_id)s
+), flair AS (
+    SELECT ({computed_flair_sql('person')}) AS j FROM person WHERE id = %(person_id)s
+)
+SELECT
+    json_build_object(
+        'photo',                  (SELECT j FROM photo_),
+        'photo_extra_exts',       (SELECT j FROM photo_extra_exts),
+        'photo_blurhash',         (SELECT j FROM photo_blurhash),
+        'photo_verification',     (SELECT j FROM photo_verification),
+        'audio_bio_max_seconds',  {constants.MAX_AUDIO_SECONDS},
+        'audio_bio',              (SELECT j FROM audio_bio),
+        'name',                   (SELECT j FROM name),
+        'url_slug',               (SELECT j FROM url_slug),
+        'about',                  (SELECT j FROM about),
+        'gender',                 (SELECT j FROM gender),
+        'orientation',            (SELECT j FROM orientation),
+        'ethnicity',              (SELECT j FROM ethnicity),
+        'location',               (SELECT j FROM location),
+        'occupation',             (SELECT j FROM occupation),
+        'education',              (SELECT j FROM education),
+        'height',                 (SELECT j FROM height),
+        'body type',              (SELECT j FROM body_type),
+        'looking for',            (SELECT j FROM looking_for),
+        'smoking',                (SELECT j FROM smoking),
+        'drinking',               (SELECT j FROM drinking),
+        'drugs',                  (SELECT j FROM drugs),
+        'long distance',          (SELECT j FROM long_distance),
+        'relationship status',    (SELECT j FROM relationship_status),
+        'has kids',               (SELECT j FROM has_kids),
+        'wants kids',             (SELECT j FROM wants_kids),
+        'exercise',               (SELECT j FROM exercise),
+        'religion',               (SELECT j FROM religion),
+        'star sign',              (SELECT j FROM star_sign),
+
+        'clubs',                  (SELECT j FROM clubs),
+
+        'spotify_artists',        COALESCE((SELECT top_artists FROM spotify), '[]'::jsonb),
+        'spotify_connected',      EXISTS (SELECT 1 FROM spotify),
+        'spotify_artists_synced', COALESCE((SELECT artists_synced FROM spotify), FALSE),
+        'spotify_tester',         (SELECT j FROM spotify_tester),
+
+        'units',                  (SELECT j FROM unit),
+
+        'chats',                  (SELECT j FROM chat),
+        'intros',                 (SELECT j FROM intro),
+        'visitors',               (SELECT j FROM visitor),
+
+        'verification level',     (SELECT j FROM privacy_verification_level),
+        'public profile',         (SELECT j FROM public_profile),
+        'show my location',       (SELECT j FROM show_my_location),
+        'show my online status',  (SELECT j FROM show_my_online_status),
+        'show my age',            (SELECT j FROM show_my_age),
+        'show my looking for',    (SELECT j FROM show_my_looking_for),
+        'hide me from strangers', (SELECT j FROM hide_me_from_strangers),
+        'browse invisibly',       (SELECT j FROM browse_invisibly),
+
+        'verified_gender',        (SELECT j FROM verified_gender),
+        'verified_age',           (SELECT j FROM verified_age),
+        'verified_ethnicity',     (SELECT j FROM verified_ethnicity),
+
+        'theme', json_build_object(
+            'title_color',            (SELECT j FROM title_color),
+            'body_color',             (SELECT j FROM body_color),
+            'background_color',       (SELECT j FROM background_color)
+        ),
+
+        'flair', (SELECT j FROM flair)
+
+    )::jsonb || jsonb_build_object(
+        'paypal_subscription', (SELECT j FROM paypal_subscription)
+    ) AS j
+"""
+
+Q_DELETE_PROFILE_INFO_PHOTO = """
+WITH deleted_photo AS (
+    DELETE FROM
+        photo
+    WHERE
+        person_id = %(person_id)s
+    AND
+        position = %(position)s
+    RETURNING
+        uuid
+), deleted_person_event AS (
+    UPDATE
+        person
+    SET
+        last_event_time = sign_up_time,
+        last_event_name = 'joined',
+        last_event_data = '{}'
+    WHERE
+        id = %(person_id)s
+    AND
+        (last_event_data->>'added_photo_uuid')::TEXT = (
+            SELECT
+                uuid
+            FROM
+                deleted_photo
+        )
+)
+INSERT INTO undeleted_photo (
+    uuid
+)
+SELECT
+    uuid
+FROM
+    deleted_photo
+"""
+
+Q_DELETE_PROFILE_INFO_AUDIO = """
+WITH deleted_audio AS (
+    DELETE FROM
+        audio
+    WHERE
+        person_id = %(person_id)s
+    AND
+        position = %(position)s
+    RETURNING
+        uuid
+), deleted_person_event AS (
+    UPDATE
+        person
+    SET
+        last_event_time = sign_up_time,
+        last_event_name = 'joined',
+        last_event_data = '{}'
+    WHERE
+        id = %(person_id)s
+    AND
+        (last_event_data->>'added_audio_uuid')::TEXT = (
+            SELECT
+                uuid
+            FROM
+                deleted_audio
+        )
+)
+INSERT INTO undeleted_audio (
+    uuid
+)
+SELECT
+    uuid
+FROM
+    deleted_audio
+"""
+
+Q_GET_SEARCH_FILTERS = """
+WITH answer AS (
+    SELECT COALESCE(
+        array_agg(
+            json_build_object(
+                'question_id', question_id,
+                'question', question,
+                'topic', topic,
+                'answer', answer,
+                'accept_unanswered', accept_unanswered
+            )
+            ORDER BY question_id
+        ),
+        ARRAY[]::JSON[]
+    ) AS j
+    FROM search_preference_answer
+    LEFT JOIN question
+    ON question.id = question_id
+    WHERE person_id = %(person_id)s
+), sp AS (
+    SELECT *
+    FROM search_preference
+    WHERE person_id = %(person_id)s
+), gender AS (
+    SELECT COALESCE(array_agg(name ORDER BY name), ARRAY[]::TEXT[]) AS j
+    FROM gender, sp
+    WHERE gender.id = ANY(sp.gender_ids)
+), orientation AS (
+    SELECT COALESCE(array_agg(name ORDER BY name), ARRAY[]::TEXT[]) AS j
+    FROM orientation, sp
+    WHERE orientation.id = ANY(sp.orientation_ids)
+), ethnicity AS (
+    SELECT COALESCE(array_agg(name ORDER BY name), ARRAY[]::TEXT[]) AS j
+    FROM ethnicity, sp
+    WHERE ethnicity.id = ANY(sp.ethnicity_ids)
+), age AS (
+    SELECT json_build_object(
+        'min_age', min_age,
+        'max_age', max_age
+    ) AS j
+    FROM sp
+), furthest_distance AS (
+    SELECT distance AS j
+    FROM sp
+), same_country_only AS (
+    SELECT same_country_only AS j
+    FROM sp
+), height AS (
+    SELECT json_build_object(
+        'min_height_cm', min_height_cm,
+        'max_height_cm', max_height_cm
+    ) AS j
+    FROM sp
+), has_a_profile_picture AS (
+    SELECT COALESCE(array_agg(name ORDER BY name), ARRAY[]::TEXT[]) AS j
+    FROM yes_no, sp
+    WHERE yes_no.id = ANY(sp.has_profile_picture_ids)
+), body_type AS (
+    SELECT COALESCE(array_agg(name ORDER BY name), ARRAY[]::TEXT[]) AS j
+    FROM body_type, sp
+    WHERE body_type.id = ANY(sp.body_type_ids)
+), looking_for AS (
+    SELECT COALESCE(array_agg(name ORDER BY name), ARRAY[]::TEXT[]) AS j
+    FROM looking_for, sp
+    WHERE looking_for.id = ANY(sp.looking_for_ids)
+), smoking AS (
+    SELECT COALESCE(array_agg(name ORDER BY name), ARRAY[]::TEXT[]) AS j
+    FROM yes_no_optional, sp
+    WHERE yes_no_optional.id = ANY(sp.smoking_ids)
+), drinking AS (
+    SELECT COALESCE(array_agg(name ORDER BY name), ARRAY[]::TEXT[]) AS j
+    FROM frequency, sp
+    WHERE frequency.id = ANY(sp.drinking_ids)
+), drugs AS (
+    SELECT COALESCE(array_agg(name ORDER BY name), ARRAY[]::TEXT[]) AS j
+    FROM yes_no_optional, sp
+    WHERE yes_no_optional.id = ANY(sp.drugs_ids)
+), long_distance AS (
+    SELECT COALESCE(array_agg(name ORDER BY name), ARRAY[]::TEXT[]) AS j
+    FROM yes_no_optional, sp
+    WHERE yes_no_optional.id = ANY(sp.long_distance_ids)
+), relationship_status AS (
+    SELECT COALESCE(array_agg(name ORDER BY name), ARRAY[]::TEXT[]) AS j
+    FROM relationship_status, sp
+    WHERE relationship_status.id = ANY(sp.relationship_status_ids)
+), has_kids AS (
+    SELECT COALESCE(array_agg(name ORDER BY name), ARRAY[]::TEXT[]) AS j
+    FROM yes_no_optional, sp
+    WHERE yes_no_optional.id = ANY(sp.has_kids_ids)
+), wants_kids AS (
+    SELECT COALESCE(array_agg(name ORDER BY name), ARRAY[]::TEXT[]) AS j
+    FROM yes_no_maybe, sp
+    WHERE yes_no_maybe.id = ANY(sp.wants_kids_ids)
+), exercise AS (
+    SELECT COALESCE(array_agg(name ORDER BY name), ARRAY[]::TEXT[]) AS j
+    FROM frequency, sp
+    WHERE frequency.id = ANY(sp.exercise_ids)
+), religion AS (
+    SELECT COALESCE(array_agg(name ORDER BY name), ARRAY[]::TEXT[]) AS j
+    FROM religion, sp
+    WHERE religion.id = ANY(sp.religion_ids)
+), star_sign AS (
+    SELECT COALESCE(array_agg(name ORDER BY name), ARRAY[]::TEXT[]) AS j
+    FROM star_sign, sp
+    WHERE star_sign.id = ANY(sp.star_sign_ids)
+), people_you_messaged AS (
+    SELECT CASE WHEN show_messaged THEN 'Yes' ELSE 'No' END AS j
+    FROM sp
+), people_you_skipped AS (
+    SELECT CASE WHEN show_skipped THEN 'Yes' ELSE 'No' END AS j
+    FROM sp
+), reply_rate AS (
+    SELECT min_reply_percentage AS j
+    FROM sp
+), last_online_pref AS (
+    SELECT last_online.name AS j
+    FROM sp
+    JOIN last_online
+    ON last_online.id = sp.last_online_id
+), sort_by_pref AS (
+    SELECT sort_by.name AS j
+    FROM sp
+    JOIN sort_by
+    ON sort_by.id = sp.sort_by_id
+), two_way_filters AS (
+    SELECT json_build_object(
+        'gender',                two_way_gender,
+        'age',                   two_way_age,
+        'furthest_distance',     two_way_furthest_distance,
+        'orientation',           two_way_orientation,
+        'relationship_status',   two_way_relationship_status,
+        'looking_for',           two_way_looking_for,
+        'wants_kids',            two_way_wants_kids,
+        'has_kids',              two_way_has_kids,
+        'has_a_profile_picture', two_way_has_a_profile_picture,
+        'drugs',                 two_way_drugs,
+        'long_distance',         two_way_long_distance,
+        'ethnicity',             two_way_ethnicity,
+        'smoking',               two_way_smoking,
+        'religion',              two_way_religion,
+        'drinking',              two_way_drinking,
+        'height',                two_way_height,
+        'body_type',             two_way_body_type,
+        'exercise',              two_way_exercise,
+        'star_sign',             two_way_star_sign
+    ) AS j
+    FROM sp
+)
+SELECT
+    json_build_object(
+        'answer',                 (SELECT j FROM answer),
+
+        'gender',                 (SELECT j FROM gender),
+        'orientation',            (SELECT j FROM orientation),
+        'ethnicity',              (SELECT j FROM ethnicity),
+        'age',                    (SELECT j FROM age),
+        'furthest_distance',      (SELECT j FROM furthest_distance),
+        'same_country_only',      (SELECT j FROM same_country_only),
+        'last_online',            (SELECT j FROM last_online_pref),
+        'height',                 (SELECT j FROM height),
+        'body_type',              (SELECT j FROM body_type),
+        'has_a_profile_picture',  (SELECT j FROM has_a_profile_picture),
+        'looking_for',            (SELECT j FROM looking_for),
+        'smoking',                (SELECT j FROM smoking),
+        'drinking',               (SELECT j FROM drinking),
+        'drugs',                  (SELECT j FROM drugs),
+        'long_distance',          (SELECT j FROM long_distance),
+        'relationship_status',    (SELECT j FROM relationship_status),
+        'has_kids',               (SELECT j FROM has_kids),
+        'wants_kids',             (SELECT j FROM wants_kids),
+        'exercise',               (SELECT j FROM exercise),
+        'religion',               (SELECT j FROM religion),
+        'star_sign',              (SELECT j FROM star_sign),
+
+        'people_you_messaged',    (SELECT j FROM people_you_messaged),
+        'people_you_skipped',     (SELECT j FROM people_you_skipped),
+        'reply_rate',             (SELECT j FROM reply_rate),
+
+        'sort_by',               (SELECT j FROM sort_by_pref),
+
+        'two_way_filters',        (SELECT j FROM two_way_filters)
+    ) AS j
+"""
+
+Q_DELETE_SEARCH_FILTER_ANSWER = """
+WITH deleted_answer AS (
+    DELETE FROM search_preference_answer
+    WHERE
+        person_id = %(person_id)s AND
+        question_id = %(question_id)s
+    RETURNING *
+)
+SELECT COALESCE(
+    array_agg(
+        json_build_object(
+            'question_id', question_id,
+            'question', question,
+            'topic', topic,
+            'answer', answer,
+            'accept_unanswered', accept_unanswered
+        )
+        ORDER BY question_id
+    ),
+    ARRAY[]::JSON[]
+) AS j
+FROM search_preference_answer
+LEFT JOIN question
+ON question.id = question_id
+WHERE
+    person_id = %(person_id)s AND
+    question_id != (SELECT question_id FROM deleted_answer)
+"""
+
+Q_UPSERT_SEARCH_FILTER_ANSWER = f"""
+WITH existing_search_preference_answer AS (
+    SELECT
+        person_id,
+        question_id,
+        answer,
+        accept_unanswered,
+        0 AS precedence
+    FROM search_preference_answer
+    WHERE person_id = %(person_id)s
+), new_search_preference_answer AS (
+    SELECT
+        %(person_id)s AS person_id,
+        %(question_id)s AS question_id,
+        %(answer)s AS answer,
+        %(accept_unanswered)s AS accept_unanswered,
+        1 AS precedence
+), updated_search_preference_answer AS (
+    SELECT DISTINCT ON (person_id, question_id)
+        person_id,
+        question_id,
+        answer,
+        accept_unanswered
+    FROM (
+        (SELECT * from existing_search_preference_answer)
+        UNION
+        (SELECT * from new_search_preference_answer)
+    ) AS t
+    ORDER BY person_id, question_id, precedence DESC
+), inserted_search_preference_answer AS (
+    INSERT INTO search_preference_answer (
+        person_id, question_id, answer, accept_unanswered
+    ) SELECT
+        person_id, question_id, answer, accept_unanswered
+    FROM
+        new_search_preference_answer
+    WHERE (
+        SELECT COUNT(*) FROM updated_search_preference_answer
+    ) <= {MAX_SEARCH_FILTER_ANSWERS}
+    ON CONFLICT (person_id, question_id) DO UPDATE SET
+        answer            = EXCLUDED.answer,
+        accept_unanswered = EXCLUDED.accept_unanswered
+)
+SELECT array_agg(
+    json_build_object(
+        'question_id', question_id,
+        'question', question,
+        'topic', topic,
+        'answer', answer,
+        'accept_unanswered', accept_unanswered
+    )
+    ORDER BY question_id
+) AS j
+FROM updated_search_preference_answer
+LEFT JOIN question
+ON question.id = question_id
+WHERE (
+    SELECT COUNT(*) FROM updated_search_preference_answer
+) <= {MAX_SEARCH_FILTER_ANSWERS}
+"""
+
+Q_TOP_CLUBS = f"""
+SELECT
+    name,
+    count_members
+FROM
+    club
+ORDER BY
+    count_members DESC,
+    name
+LIMIT {MAX_CLUB_SEARCH_RESULTS}
+"""
+
+Q_SEARCH_CLUBS = f"""
+WITH currently_joined_club AS (
+    SELECT
+        club_name AS name
+    FROM
+        person_club
+    WHERE
+        person_id = %(person_id)s
+), is_allowed_club_name AS (
+    {Q_IS_ALLOWED_CLUB_NAME.replace('%()s', '%(search_string)s')}
+), maybe_stuff_the_user_typed AS (
+    SELECT
+        %(search_string)s AS name,
+        COALESCE(
+            (SELECT count_members FROM club WHERE name = %(search_string)s),
+            0
+        ) AS count_members
+    WHERE
+        NOT EXISTS (
+            SELECT 1 FROM currently_joined_club WHERE name = %(search_string)s
+        )
+    AND
+        (SELECT is_allowed_club_name FROM is_allowed_club_name)
+    LIMIT
+        1
+), fuzzy_match AS (
+    SELECT
+        name,
+        count_members
+    FROM
+        club
+    WHERE
+        name NOT IN (SELECT name FROM currently_joined_club)
+    AND
+        name NOT IN (SELECT name FROM maybe_stuff_the_user_typed)
+    AND
+        count_members > 0
+    ORDER BY
+        lower(name) <-> %(search_string)s
+    LIMIT
+        {MAX_CLUB_SEARCH_RESULTS} - (SELECT COUNT(*) FROM maybe_stuff_the_user_typed)
+)
+SELECT
+    name,
+    count_members
+FROM (
+    SELECT name, count_members FROM fuzzy_match UNION
+    SELECT name, count_members FROM maybe_stuff_the_user_typed
+)
+ORDER BY
+    count_members = 0,
+    name <-> %(search_string)s,
+    count_members DESC,
+    name
+"""
+
+Q_JOIN_CLUB = f"""
+WITH is_allowed_club_name AS (
+    {Q_IS_ALLOWED_CLUB_NAME.replace('%()s', '%(club_name)s')}
+), quota AS (
+  SELECT
+      {club_quota_sql(has_gold_sql('person.id'))} AS quota
+  FROM
+      person
+  WHERE
+      id = %(person_id)s
+), will_be_within_club_quota AS (
+    SELECT
+        COUNT(*) < (SELECT quota FROM quota) AS x
+    FROM
+        person_club
+    WHERE
+        person_id = %(person_id)s
+), existing_club AS (
+    SELECT
+        name
+    FROM
+        club
+    WHERE
+        name = %(club_name)s
+    AND
+        (SELECT is_allowed_club_name FROM is_allowed_club_name)
+    AND
+        (SELECT x FROM will_be_within_club_quota)
+), inserted_club AS (
+    INSERT INTO club (
+        name
+    )
+    SELECT
+        %(club_name)s
+    WHERE
+        (SELECT is_allowed_club_name FROM is_allowed_club_name)
+    AND
+        (SELECT x FROM will_be_within_club_quota)
+    AND
+        NOT EXISTS (SELECT 1 FROM club WHERE name = %(club_name)s)
+    ON CONFLICT (name) DO NOTHING
+    RETURNING
+        name
+), existing_or_inserted_club AS (
+    SELECT name FROM existing_club UNION
+    SELECT name FROM inserted_club
+), inserted_person_club AS (
+    INSERT INTO person_club (
+        person_id,
+        club_name
+    )
+    SELECT
+        %(person_id)s,
+        name
+    FROM
+        existing_or_inserted_club
+    ON CONFLICT (person_id, club_name) DO NOTHING
+    RETURNING
+        club_name
+), updated_person AS (
+    UPDATE
+        person
+    SET
+        last_event_time = now(),
+        last_event_name = 'joined-club',
+        last_event_data = jsonb_build_object(
+            'joined_club_name', inserted_person_club.club_name
+        )
+    FROM
+        inserted_person_club
+    WHERE
+        person.id = %(person_id)s
+    AND
+        %(update_event)s
+)
+SELECT
+    1
+FROM
+    existing_or_inserted_club
+LIMIT 1
+"""
+
+Q_LEAVE_CLUB = """
+WITH deleted_person_club AS (
+    DELETE FROM
+        person_club
+    WHERE
+        person_id = %(person_id)s
+    AND
+        club_name = %(club_name)s
+    RETURNING
+        club_name
+)
+-- Stop advertising the club in the feed if it's the person's latest event
+UPDATE
+    person
+SET
+    last_event_time = sign_up_time,
+    last_event_name = 'joined',
+    last_event_data = '{}'::jsonb
+WHERE
+    id = %(person_id)s
+AND
+    last_event_name = 'joined-club'
+AND
+    last_event_data->>'joined_club_name' = %(club_name)s
+"""
+
+# Club SEO page queries. The heavy aggregation lives in the cron package
+# (service/cron/clubseo/sql); these are the single-row reads.
+
+def _has_embedding(club: str) -> str:
+    return f'{club}.embedding != array_full(64, 0)::VECTOR(64)'
+
+
+# Gated on the live member threshold (not the cached club_stats row) so a
+# club that's dropped below it 404s immediately rather than waiting for
+# the cron to clean up.
+Q_CLUB_PAGE_READ = f"""
+SELECT
+    cs.stats_json,
+    seo.description,
+    COALESCE(cta.answers_json, '[]'::jsonb) AS top_answers
+FROM
+    club c
+JOIN
+    club_stats cs ON cs.club_name = c.name
+LEFT JOIN
+    club_seo seo ON seo.club_name = c.name
+LEFT JOIN
+    club_top_answers cta ON cta.club_name = c.name
+WHERE
+    c.name = %(club_name)s
+AND
+    c.count_members >= {MIN_CLUB_PAGE_MEMBERS}
+"""
+
+# Related clubs are the nearest neighbours of the club's embedding.
+Q_RELATED_CLUBS = f"""
+SELECT
+    COALESCE(
+        json_agg(
+            json_build_object(
+                'name',          nearest.name,
+                'count_members', nearest.count_members
+            )
+            ORDER BY nearest.distance
+        ),
+        '[]'::json
+    ) AS related_clubs
+FROM (
+    SELECT
+        other.name,
+        other.count_members,
+        other.embedding <=> c.embedding AS distance
+    FROM
+        club c
+    JOIN
+        club other
+    ON
+        other.name != c.name
+    WHERE
+        c.name = %(club_name)s
+    AND
+        other.count_members >= {MIN_CLUB_PAGE_MEMBERS}
+    AND
+        {_has_embedding('other')}
+    AND
+        {_has_embedding('c')}
+    ORDER BY
+        distance
+    LIMIT {MAX_RELATED_CLUBS}
+) nearest
+"""
+
+Q_CLUB_COUNT_MEMBERS = """
+SELECT
+    COALESCE(
+        (SELECT count_members FROM club WHERE name = %(club_name)s),
+        0
+    ) AS count_members
+"""
+
+Q_JOINED_CLUB_EMBEDDINGS = f"""
+SELECT
+    club.name,
+    club.embedding
+FROM
+    person_club
+JOIN
+    club
+ON
+    club.name = person_club.club_name
+WHERE
+    person_club.person_id = %(person_id)s
+AND
+    {_has_embedding('club')}
+"""
+
+Q_COUNT_JOINED_CLUBS = """
+SELECT
+    COUNT(*) AS count
+FROM
+    person_club
+WHERE
+    person_id = %(person_id)s
+"""
+
+Q_SUGGESTED_CLUB_CANDIDATES = f"""
+WITH candidate AS MATERIALIZED (
+    SELECT
+        name,
+        count_members,
+        embedding
+    FROM
+        club
+    WHERE
+        count_members >= {MIN_CLUB_PAGE_MEMBERS}
+    AND
+        name NOT IN (
+            SELECT club_name FROM person_club WHERE person_id = %(person_id)s
+        )
+)
+SELECT
+    source.name AS source,
+    nearest.name,
+    nearest.count_members
+FROM
+    club AS source
+CROSS JOIN LATERAL (
+    SELECT
+        name,
+        count_members
+    FROM
+        candidate
+    WHERE
+        {_has_embedding('candidate')}
+    ORDER BY
+        embedding <=> source.embedding
+    LIMIT
+        {MAX_SUGGESTED_CLUBS}
+) AS nearest
+WHERE
+    source.name = ANY(%(sources)s::TEXT[])
+
+UNION ALL
+
+SELECT
+    *
+FROM (
+    SELECT
+        NULL AS source,
+        name,
+        count_members
+    FROM
+        candidate
+    ORDER BY
+        count_members DESC,
+        name
+    LIMIT
+        {MAX_SUGGESTED_CLUBS}
+) AS popular
+"""
+
+Q_UPDATE_CHATS_NOTIFICATIONS = """
+WITH updated_rows AS (
+    UPDATE
+        person
+    SET
+        chats_notification = immediacy.id
+    FROM
+        immediacy
+    WHERE
+        person.email = %(email)s
+    AND
+        immediacy.name = %(frequency)s
+    RETURNING 1
+)
+SELECT
+    count(*) > 0 AS ok
+FROM
+    updated_rows
+"""
+
+Q_UPDATE_INTROS_NOTIFICATIONS = """
+WITH updated_rows AS (
+    UPDATE
+        person
+    SET
+        intros_notification = immediacy.id
+    FROM
+        immediacy
+    WHERE
+        person.email = %(email)s
+    AND
+        immediacy.name = %(frequency)s
+    RETURNING 1
+)
+SELECT
+    count(*) > 0 AS ok
+FROM
+    updated_rows
+"""
+
+Q_UPDATE_VISITORS_NOTIFICATIONS = """
+WITH updated_rows AS (
+    UPDATE
+        person
+    SET
+        visitors_notification = immediacy.id
+    FROM
+        immediacy
+    WHERE
+        person.email = %(email)s
+    AND
+        immediacy.name = %(frequency)s
+    RETURNING 1
+)
+SELECT
+    count(*) > 0 AS ok
+FROM
+    updated_rows
+"""
+
+Q_UNSUBSCRIBE = """
+UPDATE
+    person
+SET
+    chats_notification = immediacy.id,
+    intros_notification = immediacy.id,
+    visitors_notification = immediacy.id
+FROM
+    immediacy
+WHERE
+    person.uuid = %(person_uuid)s
+AND
+    immediacy.name = 'Never'
+"""
+
+Q_CHECK_ADMIN_BAN_TOKEN = """
+SELECT 1 FROM banned_person_admin_token WHERE token = %(token)s
+"""
+
+Q_ADMIN_BAN = """
+WITH deleted_token AS (
+    DELETE FROM
+        banned_person_admin_token
+    WHERE
+        token = %(token)s
+    AND
+        expires_at > NOW()
+    RETURNING
+        person_id
+), this_banned_person AS (
+    SELECT
+        normalized_email,
+        uuid AS person_uuid,
+        id AS person_id
+    FROM
+        person
+    JOIN
+        deleted_token
+    ON
+        deleted_token.person_id = person.id
+), report_reason AS (
+    SELECT
+        COALESCE(array_agg(report_reason), ARRAY[]::text[]) AS report_reasons
+    FROM
+        skipped
+    WHERE
+        reported
+    AND
+        object_person_id = (SELECT person_id FROM deleted_token)
+    AND
+        report_reason <> ''
+), _duo_session AS (
+    SELECT
+        this_banned_person.normalized_email AS normalized_email,
+        COALESCE(duo_session.ip_address, '127.0.0.1') AS ip_address
+    FROM
+        this_banned_person
+    LEFT JOIN
+        duo_session
+    ON
+        duo_session.person_id = this_banned_person.person_id
+), banned_person_insertion AS (
+    INSERT INTO banned_person (
+        normalized_email,
+        ip_address,
+        report_reasons
+    )
+    SELECT
+        normalized_email,
+        ip_address,
+        report_reasons
+    FROM
+        _duo_session,
+        report_reason
+    ON CONFLICT DO NOTHING
+)
+SELECT
+    person_id,
+    person_uuid::TEXT
+FROM
+    this_banned_person
+"""
+
+Q_CHECK_ADMIN_DELETE_PHOTO_TOKEN = """
+SELECT 1 FROM deleted_photo_admin_token WHERE token = %(token)s
+"""
+
+Q_ADMIN_DELETE_PHOTO = """
+WITH deleted_token AS (
+    DELETE FROM
+        deleted_photo_admin_token
+    WHERE
+        token = %(token)s
+    AND
+        expires_at > NOW()
+    RETURNING
+        photo_uuid
+), deleted_photo AS (
+    DELETE FROM
+        photo
+    USING
+        deleted_token
+    WHERE
+        photo.uuid = deleted_token.photo_uuid
+    RETURNING
+        photo.uuid,
+        photo.hash,
+        photo.person_id
+), deleted_person_event AS (
+    UPDATE
+        person
+    SET
+        last_event_time = sign_up_time,
+        last_event_name = 'joined',
+        last_event_data = '{}'
+    WHERE
+        id = (SELECT person_id FROM deleted_photo)
+    AND
+        (last_event_data->>'added_photo_uuid')::TEXT = (
+            SELECT
+                uuid
+            FROM
+                deleted_photo
+        )
+), inserted_undeleted_photo AS (
+    INSERT INTO undeleted_photo (
+        uuid
+    )
+    SELECT
+        uuid
+    FROM
+        deleted_photo
+    RETURNING
+        uuid
+), inserted_banned_photo_hash AS (
+    INSERT INTO banned_photo_hash (
+        hash
+    )
+    SELECT
+        hash
+    FROM
+        deleted_photo
+    WHERE
+        hash <> ''
+    ON CONFLICT DO NOTHING
+)
+SELECT
+    inserted_undeleted_photo.uuid,
+    deleted_photo.person_id
+FROM
+    inserted_undeleted_photo
+JOIN
+    deleted_photo
+ON
+    inserted_undeleted_photo.uuid = deleted_photo.uuid
+"""
+
+Q_HOURLY_STATS = f"""
+WITH active AS (
+    SELECT
+        gender_id,
+        orientation_id,
+        date_part('year', age(date_of_birth))::int AS age
+    FROM
+        person
+    WHERE
+        activated
+    AND
+        last_online_time >
+            now() - {LAST_ONLINE_DEFAULT_SECONDS} * interval '1 second'
+)
+SELECT
+    (SELECT sum(count_answers) FROM person) AS num_answers,
+
+    count(*) FILTER (WHERE gender_id = 1)::real /
+    NULLIF(count(*) FILTER (WHERE gender_id = 2), 0)::real
+    AS gender_ratio,
+
+    count(*) FILTER (WHERE gender_id NOT IN (1, 2))::real /
+    NULLIF(count(*), 0)::real *
+    100.0
+    AS non_binary_percentage,
+
+    count(*) FILTER (WHERE orientation_id = 3)::real /
+    NULLIF(count(*) FILTER (WHERE orientation_id <> 1), 0)::real *
+    100.0
+    AS gay_percentage,
+
+    count(*) FILTER (WHERE orientation_id = 4)::real /
+    NULLIF(count(*) FILTER (WHERE orientation_id <> 1), 0)::real *
+    100.0
+    AS lesbian_percentage,
+
+    round(percentile_cont(0.5) WITHIN GROUP (ORDER BY age))::int
+    AS median_age,
+
+    json_build_array(
+        json_build_object('label', '18-19', 'count', count(*) FILTER (WHERE age < 20)),
+        json_build_object('label', '20-21', 'count', count(*) FILTER (WHERE age BETWEEN 20 AND 21)),
+        json_build_object('label', '22-23', 'count', count(*) FILTER (WHERE age BETWEEN 22 AND 23)),
+        json_build_object('label', '24-25', 'count', count(*) FILTER (WHERE age BETWEEN 24 AND 25)),
+        json_build_object('label', '26-27', 'count', count(*) FILTER (WHERE age BETWEEN 26 AND 27)),
+        json_build_object('label', '28-29', 'count', count(*) FILTER (WHERE age BETWEEN 28 AND 29)),
+        json_build_object('label', '30-31', 'count', count(*) FILTER (WHERE age BETWEEN 30 AND 31)),
+        json_build_object('label', '32-33', 'count', count(*) FILTER (WHERE age BETWEEN 32 AND 33)),
+        json_build_object('label', '34+', 'count', count(*) FILTER (WHERE age >= 34))
+    )
+    AS age_buckets
+FROM
+    active
+"""
+
+Q_STATS_BY_CLUB_NAME = """
+SELECT
+    COALESCE(SUM(count_members), 0) AS num_active_users
+FROM
+    club
+WHERE
+    name = %(club_name)s
+"""
+
+Q_MINUTELY_STATS = f"""
+SELECT
+    (SELECT max(id) FROM person) AS num_sign_ups,
+
+    (
+        SELECT
+            count(*)
+        FROM
+            person
+        WHERE
+            activated
+        AND
+            last_online_time >
+                now() - {LAST_ONLINE_DEFAULT_SECONDS} * interval '1 second'
+    ) AS num_active_users
+"""
+
+Q_PERSON_ID_TO_UUID = """
+SELECT
+    uuid::text
+FROM
+    person
+WHERE
+    id = %(person_id)s
+"""
+
+Q_ADMIN_TOKEN_TO_UUID = """
+SELECT
+    person.uuid::text AS person_uuid
+FROM
+    person
+JOIN
+    banned_person_admin_token
+ON
+    banned_person_admin_token.person_id = person.id
+WHERE
+    banned_person_admin_token.token = %(token)s
+"""
+
+Q_DELETE_VERIFICATION_JOB = """
+WITH deleted_job AS (
+    DELETE FROM
+        verification_job
+    WHERE
+        person_id = %(person_id)s
+    RETURNING
+        photo_uuid AS uuid
+)
+INSERT INTO undeleted_photo (
+    uuid
+)
+SELECT
+    uuid
+FROM
+    deleted_job
+"""
+
+Q_INSERT_VERIFICATION_JOB = """
+INSERT INTO verification_job (
+    person_id,
+    photo_uuid
+) VALUES (
+    %(person_id)s,
+    %(photo_uuid)s
+)
+"""
+
+Q_INSERT_VERIFICATION_PHOTO_HASH = """
+INSERT INTO verification_photo_hash (
+    hash
+)
+VALUES
+    (%(photo_hash)s)
+ON CONFLICT DO NOTHING
+RETURNING
+    1
+"""
+
+Q_UPDATE_VERIFICATION_JOB = """
+UPDATE
+    verification_job
+SET
+    status = %(status)s,
+    message = %(message)s
+WHERE
+    person_id = %(person_id)s
+AND (
+        status = %(expected_previous_status)s
+    OR
+        %(expected_previous_status)s::verification_job_status IS NULL
+)
+"""
+
+Q_CHECK_VERIFICATION = """
+SELECT
+    person.verified_gender,
+    person.verified_age,
+    person.verified_ethnicity,
+    (
+        SELECT json_object_agg(position, verified) AS j
+        FROM photo
+        WHERE person_id = %(person_id)s
+    ) AS verified_photos,
+    verification_job.status,
+    verification_job.message
+FROM
+    person
+LEFT JOIN
+    verification_job
+ON
+    verification_job.person_id = person.id
+WHERE
+    person.id = %(person_id)s
+"""
+
+Q_INSERT_EXPORT_DATA_TOKEN = """
+INSERT INTO export_data_token (
+    person_id
+)
+VALUES
+    (%(person_id)s)
+RETURNING
+    token
+"""
+
+Q_CHECK_EXPORT_DATA_TOKEN = """
+WITH deleted_export_data_token AS (
+    DELETE FROM
+        export_data_token
+    WHERE
+        token = %(token)s
+    AND
+        expires_at > NOW()
+    RETURNING
+        person_id
+)
+SELECT
+    person.id AS person_id,
+    person.uuid AS person_uuid
+FROM
+    person
+JOIN
+    deleted_export_data_token
+ON
+    deleted_export_data_token.person_id = person.id
+"""
+
+Q_EXPORT_API_DATA = """
+SELECT json_build_object(
+    'person', (
+        SELECT
+            -- `shadow_banned_at` is stripped: a shadow-banned user's own export
+            -- must not reveal the ban.
+            json_agg(to_jsonb(t) - 'shadow_banned_at')
+        FROM (
+            SELECT
+                person.*,
+                gender.name AS gender_name,
+                has_profile_picture.name AS has_profile_picture_name,
+                verification_level.name AS verification_level_name,
+                orientation.name AS orientation_name,
+                ethnicity.name AS ethnicity_name,
+                body_type.name AS body_type_name,
+                ARRAY(
+                    SELECT name
+                    FROM looking_for
+                    WHERE id = ANY(person.looking_for_ids)
+                    ORDER BY id
+                ) AS looking_for_names,
+                smoking.name AS smoking_name,
+                drinking.name AS drinking_name,
+                drugs.name AS drugs_name,
+                long_distance.name AS long_distance_name,
+                relationship_status.name AS relationship_status_name,
+                has_kids.name AS has_kids_name,
+                wants_kids.name AS wants_kids_name,
+                exercise.name AS exercise_name,
+                religion.name AS religion_name,
+                star_sign.name AS star_sign_name,
+                unit.name AS unit_name,
+                chats_notification.name AS chats_notification_name,
+                intros_notification.name AS intros_notification_name,
+                visitors_notification.name AS visitors_notification_name,
+                privacy_verification_level.name AS privacy_verification_level_name,
+                show_my_location.name AS show_my_location_name
+            FROM
+                person
+            LEFT JOIN
+                gender ON
+                gender.id = gender_id
+            LEFT JOIN
+                yes_no AS
+                has_profile_picture ON
+                has_profile_picture.id = has_profile_picture_id
+            LEFT JOIN
+                verification_level ON
+                verification_level.id = verification_level_id
+            LEFT JOIN
+                orientation ON
+                orientation.id = person.id
+            LEFT JOIN
+                ethnicity ON
+                ethnicity.id = ethnicity_id
+            LEFT JOIN
+                body_type ON
+                body_type.id = body_type_id
+            LEFT JOIN
+                yes_no_optional AS
+                smoking ON
+                smoking.id = smoking_id
+            LEFT JOIN
+                frequency AS
+                drinking ON
+                drinking.id = drinking_id
+            LEFT JOIN
+                yes_no_optional AS
+                drugs ON
+                drugs.id = drugs_id
+            LEFT JOIN
+                yes_no_optional AS
+                long_distance ON
+                long_distance.id = long_distance_id
+            LEFT JOIN
+                yes_no_optional AS
+                relationship_status ON
+                relationship_status.id = relationship_status_id
+            LEFT JOIN
+                yes_no_optional AS
+                has_kids ON
+                has_kids.id = has_kids_id
+            LEFT JOIN
+                yes_no_maybe AS
+                wants_kids ON
+                wants_kids.id = wants_kids_id
+            LEFT JOIN
+                frequency AS
+                exercise ON
+                exercise.id = exercise_id
+            LEFT JOIN
+                religion ON
+                religion.id = religion_id
+            LEFT JOIN
+                star_sign ON
+                star_sign.id = star_sign_id
+            LEFT JOIN
+                unit ON
+                unit.id = unit_id
+            LEFT JOIN
+                immediacy AS
+                chats_notification ON
+                chats_notification.id = person.chats_notification
+            LEFT JOIN
+                immediacy AS
+                intros_notification ON
+                intros_notification.id = person.intros_notification
+            LEFT JOIN
+                immediacy AS
+                visitors_notification ON
+                visitors_notification.id = person.visitors_notification
+            LEFT JOIN
+                verification_level AS
+                privacy_verification_level ON
+                privacy_verification_level.id = person.privacy_verification_level_id
+            LEFT JOIN
+                yes_country_only_no AS
+                show_my_location ON
+                show_my_location.id = person.show_my_location_id
+
+            WHERE
+                person.id = %(person_id)s
+        ) AS t
+    ),
+
+    'photo', (
+        SELECT
+            json_agg(row_to_json(t))
+        FROM (
+            SELECT
+                *,
+
+                'https://user-images.duolicious.app/original-' ||
+                    uuid ||
+                    '.jpg' AS photo_url
+
+            FROM
+                photo
+            WHERE
+                person_id = %(person_id)s
+            ORDER BY
+                position
+        ) AS t
+    ),
+
+    'answer', (
+        SELECT
+            json_agg(row_to_json(t))
+        FROM (
+            SELECT
+                question.id,
+                question.question,
+                answer.answer,
+                answer.public_
+            FROM
+                answer
+            JOIN
+                question
+            ON
+                question.id = question_id
+            WHERE
+                person_id = %(person_id)s
+        ) AS t
+    ),
+
+    'verification_job', (
+        SELECT
+            json_agg(row_to_json(t))
+        FROM (
+            SELECT
+                *,
+
+                'https://user-images.duolicious.app/450-' ||
+                    photo_uuid ||
+                    '.jpg' AS photo_url
+            FROM
+                verification_job
+            WHERE
+                person_id = %(person_id)s
+        ) AS t
+    ),
+
+    'person_club', (
+        SELECT
+            json_agg(row_to_json(person_club))
+        FROM
+            person_club
+        WHERE
+            person_id = %(person_id)s
+    ),
+
+    'person_spotify', (
+        SELECT
+            json_agg(row_to_json(t))
+        FROM (
+            SELECT
+                top_artists
+            FROM
+                person_spotify
+            WHERE
+                person_id = %(person_id)s
+        ) AS t
+    ),
+
+    'gold_subscription', (
+        SELECT
+            json_agg(row_to_json(t))
+        FROM (
+            SELECT
+                provider,
+                provider_subscription_id,
+                expires_at
+            FROM
+                gold_subscription
+            WHERE
+                person_id = %(person_id)s
+        ) AS t
+    ),
+
+    'skipped', (
+        SELECT
+            json_agg(row_to_json(skipped))
+        FROM
+            skipped
+        WHERE
+            subject_person_id = %(person_id)s
+    ),
+
+    'messaged', (
+        SELECT
+            json_agg(row_to_json(messaged))
+        FROM
+            messaged
+        WHERE
+            subject_person_id = %(person_id)s
+    ),
+
+    'mam_message', (
+        SELECT
+            json_agg(row_to_json(mam_message))
+        FROM
+            mam_message
+        WHERE
+            person_id = %(person_id)s
+    ),
+
+    'presence_histogram', (
+        SELECT
+            json_agg(row_to_json(presence_histogram))
+        FROM
+            presence_histogram
+        WHERE
+            person_id = %(person_id)s
+    )
+
+) AS j
+"""
+
+Q_GET_SESSION_CLUBS = """
+SELECT
+    COALESCE(
+        (
+            SELECT
+                json_agg(
+                    json_build_object(
+                        'name',
+                        person_club.club_name,
+
+                        'count_members',
+                        -1,
+
+                        'search_preference',
+                        person_club.club_name IS NOT DISTINCT FROM search_preference.club_name
+                    )
+                    ORDER BY
+                        person_club.club_name
+                )
+            FROM
+                person_club
+            LEFT JOIN
+                search_preference
+            ON
+                search_preference.person_id = person_club.person_id
+            WHERE
+                person_club.person_id = %(person_id)s
+        ),
+        '[]'::json
+    ) AS clubs,
+    (
+        SELECT
+            json_build_object(
+                'name',
+                %(pending_club_name)s::TEXT,
+
+                'count_members',
+                (
+                    SELECT
+                        coalesce(sum(count_members), 0)
+                    FROM
+                        club
+                    WHERE
+                        name = %(pending_club_name)s
+                )
+            )
+        WHERE
+            %(pending_club_name)s::TEXT IS NOT NULL
+    ) AS pending_club
+"""
+
+# ---------------------------------------------------------------------------
+# Social login (Google / Apple)
+# ---------------------------------------------------------------------------
+
+# True when the caller is currently banned, by either normalized email
+# or IP. Used by both /request-otp and the social sign-in path as the
+# first statement inside their api_tx() block; the OTP-issuing /
+# session-issuing query then runs against the same snapshot.
+#
+# We don't repeat the bad_email_domain check here because Apple/Google
+# already gate disposable providers, and Apple's
+# @privaterelay.appleid.com would otherwise trip an overzealous filter.
+# The OTP path keeps that filter inside `_OTP_CTE` for new sign-ups.
+Q_IS_BANNED = """
+SELECT 1
+WHERE EXISTS (
+    SELECT 1
+    FROM banned_person
+    WHERE
+        (normalized_email = %(normalized_email)s OR ip_address = %(ip_address)s)
+    AND
+        expires_at > NOW()
+)
+"""
+
+# Look up a linked person by provider sub. Excludes bots — a bot account
+# returning here would bypass the bot check that the OTP path performs.
+Q_LOOKUP_SOCIAL_IDENTITY = """
+SELECT
+    person.id AS person_id
+FROM
+    social_identity
+JOIN
+    person ON person.id = social_identity.person_id
+WHERE
+    social_identity.provider = %(provider)s
+AND
+    social_identity.provider_sub = %(provider_sub)s
+AND
+    NOT 'bot' = ANY(person.roles)
+"""
+
+# Auto-link path: find a person by normalized_email so a verified social
+# email can claim an existing OTP-only account without an OTP round-trip.
+# Matches `Q_INSERT_DUO_SESSION`'s tiebreaker (prefer exact-case email).
+Q_LOOKUP_PERSON_BY_EMAIL = """
+SELECT
+    id AS person_id
+FROM
+    person
+WHERE
+    normalized_email = %(normalized_email)s
+AND
+    NOT 'bot' = ANY(roles)
+ORDER BY
+    email = %(email)s DESC,
+    email
+LIMIT 1
+"""
+
+Q_INSERT_SOCIAL_IDENTITY = """
+INSERT INTO social_identity (
+    provider,
+    provider_sub,
+    person_id,
+    email
+) VALUES (
+    %(provider)s,
+    %(provider_sub)s,
+    %(person_id)s,
+    %(email)s
+)
+ON CONFLICT (provider, provider_sub) DO NOTHING
+"""
+
+# Create the onboardee row for a brand-new social sign-up. The user picks
+# their display name later in the onboarding wizard — we deliberately
+# don't seed it from the provider.
+Q_UPSERT_ONBOARDEE_FOR_SOCIAL = """
+INSERT INTO onboardee (email)
+VALUES (%(email)s)
+ON CONFLICT (email) DO NOTHING
+"""
+
+# `pending_social_*` are non-null only when the identity still has to be
+# linked: after onboarding for a brand-new user, or after `/check-otp` for an
+# existing account the provider's email can't claim by itself.
+Q_INSERT_DUO_SESSION_SOCIAL = """
+INSERT INTO duo_session (
+    session_token_hash,
+    person_id,
+    email,
+    pending_club_name,
+    ref,
+    ip_address,
+    signed_in,
+    pending_social_provider,
+    pending_social_sub,
+    asns
+) VALUES (
+    %(session_token_hash)s,
+    %(person_id)s,
+    %(email)s,
+    %(pending_club_name)s,
+    %(ref)s,
+    %(ip_address)s,
+    %(signed_in)s,
+    %(pending_social_provider)s,
+    %(pending_social_sub)s,
+    %(asns)s::bigint[]
+)
+"""
+
+Q_AFTER_SOCIAL_SIGN_IN = f"""
+WITH existing_person_before_update AS (
+    SELECT
+        id
+    FROM
+        person
+    WHERE
+        id = %(person_id)s
+), {_Q_POST_SIGN_IN_CTES}
+SELECT
+    existing_person.id AS person_id,
+    existing_person.person_uuid,
+    existing_person.has_gold,
+    (SELECT name FROM unit WHERE id = existing_person.unit_id) AS units,
+    {_Q_DO_SHOW_DONATION_NAG.format(table='existing_person')},
+    {_Q_ESTIMATED_END_DATE},
+    existing_person.name AS name
+FROM
+    existing_person
+"""
+
+# Drain the pending social identity from `duo_session` into
+# `social_identity` once the session's `person` exists and owns the email:
+# after onboarding, or after `/check-otp`.
+Q_PROMOTE_PENDING_SOCIAL_IDENTITY = """
+INSERT INTO social_identity (provider, provider_sub, person_id, email)
+SELECT
+    duo_session.pending_social_provider,
+    duo_session.pending_social_sub,
+    %(person_id)s,
+    duo_session.email
+FROM
+    duo_session
+WHERE
+    duo_session.session_token_hash = %(session_token_hash)s
+AND
+    duo_session.pending_social_provider IS NOT NULL
+AND
+    duo_session.pending_social_sub IS NOT NULL
+ON CONFLICT (provider, provider_sub) DO NOTHING
+"""
+
+Q_INSERT_PERSON_REF = """
+WITH session_ref AS (
+    SELECT ref
+    FROM duo_session
+    WHERE session_token_hash = %(session_token_hash)s
+    AND ref IS NOT NULL
+), inserted_person_ref AS (
+    INSERT INTO person_ref (person_id, ref)
+    SELECT %(person_id)s, ref
+    FROM session_ref
+)
+INSERT INTO ref_sign_up_count (ref, hour, count)
+SELECT ref, date_trunc('hour', NOW()), 1
+FROM session_ref
+ON CONFLICT (ref, hour) DO UPDATE SET
+    count = ref_sign_up_count.count + 1
+"""

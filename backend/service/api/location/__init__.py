@@ -1,0 +1,119 @@
+from serviceshared.database import api_tx
+from service.api.async_lru_cache import AsyncLruCache
+import json
+import math
+import os
+
+_locations_json_file = os.path.join(
+        os.path.dirname(__file__), '..', '..', '..',
+        'locations', 'locations.json')
+
+Q_SEARCH_LOCATIONS = """
+WITH city_prefix_match AS (
+    SELECT
+        long_friendly,
+        city
+    FROM
+        location
+    WHERE
+        starts_with(lower(city), lower(%(search_string)s))
+    ORDER BY
+        lower(city)
+    LIMIT 50
+), trigram_match AS (
+    SELECT
+        long_friendly,
+        city
+    FROM
+        location
+    WHERE
+        lower(long_friendly) LIKE lower(%(first_character)s) || '%%'
+    ORDER BY
+        lower(long_friendly) <-> %(search_string)s
+    LIMIT 50
+)
+SELECT
+    long_friendly
+FROM (
+    SELECT * FROM city_prefix_match
+    UNION
+    SELECT * FROM trigram_match
+) AS candidate
+ORDER BY
+    lower(city) = lower(%(search_string)s) DESC,
+    starts_with(lower(long_friendly), lower(%(search_string)s)) DESC,
+    lower(city) <-> %(search_string)s,
+    lower(long_friendly) <-> %(search_string)s
+LIMIT 10
+"""
+
+SQL_POINT = "ST_SetSRID(ST_MakePoint(%(lon)s, %(lat)s), 4326)::geography"
+
+Q_REVERSE_GEOCODE = f"""
+SELECT long_friendly FROM location ORDER BY coordinates <-> {SQL_POINT} LIMIT 1
+"""
+
+async def init_db() -> None:
+    with open(_locations_json_file) as f:
+        locations = json.load(f)
+
+    async with api_tx() as tx:
+        if (await tx.require_one("SELECT COUNT(*) FROM location"))['count'] != 0:
+            return
+
+        await tx.executemany(
+            """
+            INSERT INTO Location (
+                short_friendly,
+                long_friendly,
+                city,
+                subdivision,
+                country,
+                coordinates,
+                verification_required
+            ) VALUES (
+                %(short_friendly)s,
+                %(long_friendly)s,
+                %(city)s,
+                %(subdivision)s,
+                %(country)s,
+                ST_SetSRID(ST_MakePoint(%(lon)s, %(lat)s), 4326),
+                %(verification_required)s
+            ) ON CONFLICT DO NOTHING
+            """,
+            locations
+        )
+
+@AsyncLruCache(maxsize=26**3)
+async def get_search_locations(q: str | None) -> object:
+    if q is None:
+        return []
+
+    normalized_whitespace = ' '.join(q.split())
+
+    if len(normalized_whitespace) < 1:
+        return []
+
+    params = dict(
+        first_character=normalized_whitespace[0],
+        search_string=normalized_whitespace,
+    )
+
+    async with api_tx('READ COMMITTED') as tx:
+        row_tx = await tx.execute(Q_SEARCH_LOCATIONS, params)
+        rows = await row_tx.fetchall()
+        return [row['long_friendly'] for row in rows]
+
+GRID_METRES = 5000
+METRES_PER_DEGREE = 111_320
+
+def snap_to_grid(lat: float, lon: float) -> dict[str, float]:
+    step = GRID_METRES / METRES_PER_DEGREE
+    snapped_lat = max(-90.0, min(90.0, round(lat / step) * step))
+    lon_step = step / max(math.cos(math.radians(snapped_lat)), 1e-9)
+    return dict(lat=snapped_lat, lon=round(lon / lon_step) * lon_step)
+
+async def get_reverse_geocode(lat: float, lon: float) -> object:
+    async with api_tx('READ COMMITTED') as tx:
+        row = await tx.require_one(Q_REVERSE_GEOCODE, snap_to_grid(lat, lon))
+        return dict(location=row['long_friendly'])

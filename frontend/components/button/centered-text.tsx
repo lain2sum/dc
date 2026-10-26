@@ -1,0 +1,187 @@
+import {
+  TextStyle,
+  View,
+  ViewStyle,
+} from 'react-native';
+import { Pressable } from '../pressable';
+import {
+  ReactNode,
+  RefObject,
+  useRef,
+} from 'react';
+import Animated, {
+  useAnimatedStyle,
+  useSharedValue,
+  withSequence,
+  withTiming,
+} from 'react-native-reanimated';
+import { LogoActivityIndicator } from '../logo/logo-activity-indicator';
+import { DefaultText } from '../default-text';
+import { useAppTheme } from '../../app-theme/app-theme';
+import { hoverColorFor, hoverTransition, useHover } from '../hover';
+
+type ButtonWithCenteredTextApi = {
+  isEnabled: (value: boolean) => void
+  doPressAnimation: () => void
+};
+
+type ButtonWithCenteredTextProps = {
+  children?: ReactNode
+  extraChildren?: ReactNode
+  icon?: ReactNode
+  innerRef?: RefObject<ButtonWithCenteredTextApi | undefined>
+  backgroundColor?: string
+  borderColor?: string
+  borderWidth?: number
+  containerStyle?: ViewStyle
+  textStyle?: TextStyle
+  onPress?: () => void
+  secondary?: boolean
+  textColor?: string
+  fontSize?: number
+  loading?: boolean
+  growOnHover?: boolean
+};
+
+const ButtonWithCenteredText = (props: ButtonWithCenteredTextProps) => {
+  const {
+    children,
+    extraChildren,
+    icon,
+    innerRef,
+    backgroundColor,
+    borderColor,
+    borderWidth,
+    containerStyle,
+    textStyle,
+    onPress,
+    secondary,
+    textColor,
+    fontSize,
+    loading = false,
+    growOnHover = false,
+  } = props;
+
+  const { appTheme } = useAppTheme();
+  const { hovered, hoverProps } = useHover();
+
+  const restingBackgroundColor =
+    backgroundColor || (secondary ? appTheme.primaryColor : '#70f');
+  const isEnabledRef = useRef(true);
+
+  const opacityLo = 0.2;
+  const opacityHi = 1.0;
+
+  const opacity = useSharedValue(opacityHi);
+
+  const opacityStyle = useAnimatedStyle(() => ({ opacity: opacity.value }));
+
+  const fade = () => {
+    opacity.value = opacityLo;
+  };
+
+  const unfade = () => {
+    opacity.value = withTiming(opacityHi, { duration: 1000 });
+  };
+
+  class Api {
+    isEnabled(value: boolean) {
+      if (value === isEnabledRef.current) {
+        ;
+      } else if (value) {
+        unfade();
+      } else {
+        fade();
+      }
+
+      isEnabledRef.current = value;
+    }
+
+    doPressAnimation() {
+      opacity.value = withSequence(
+        withTiming(opacityLo, { duration: 0 }),
+        withTiming(opacityHi, { duration: 1000 }),
+      );
+    }
+  };
+
+  if (innerRef !== undefined) {
+    innerRef.current = new Api();
+  }
+
+  return (
+    <Pressable
+      style={{
+        marginTop: 10,
+        marginBottom: 10,
+        height: 50,
+        ...containerStyle,
+      }}
+      onPressIn={() => isEnabledRef.current && fade()}
+      onPressOut={() => isEnabledRef.current && unfade()}
+      onPress={() => isEnabledRef.current && !loading && onPress?.()}
+      {...hoverProps}
+    >
+      <Animated.View
+        style={[{
+          width: '100%',
+          height: (
+            'height' in (containerStyle ?? {}) &&
+            containerStyle?.height === undefined
+          ) ? undefined : '100%',
+          borderRadius: 999,
+          borderColor: borderColor === undefined ? 'black' : borderColor,
+          borderWidth: borderWidth === undefined ? (secondary ? 1 : 0) : borderWidth,
+          backgroundColor: hovered
+            ? hoverColorFor(restingBackgroundColor, appTheme)
+            : restingBackgroundColor,
+          transform: [{ scale: growOnHover && hovered ? 1.06 : 1 }],
+          alignItems: 'center',
+          justifyContent: 'center',
+        },
+        hoverTransition(['backgroundColor', 'transform']),
+        opacityStyle,
+        ]}
+      >
+        {loading &&
+          <LogoActivityIndicator
+            size="large"
+            color={textColor || (secondary ? "#70f" : appTheme.primaryColor)}
+          />
+        }
+        {!loading && children &&
+          <DefaultText
+            style={{
+              color: textColor || (secondary ? appTheme.secondaryColor : 'white'),
+              fontSize: fontSize || 16,
+              textAlign: 'center',
+              ...textStyle,
+            }}
+          >
+            {children}
+          </DefaultText>
+        }
+        {!loading && extraChildren}
+        {!loading && icon &&
+          <View
+            style={{
+              position: 'absolute',
+              left: 18,
+              top: 0,
+              bottom: 0,
+              justifyContent: 'center',
+            }}
+            pointerEvents="none"
+          >
+            {icon}
+          </View>
+        }
+      </Animated.View>
+    </Pressable>
+  );
+}
+
+export {
+  ButtonWithCenteredText,
+  ButtonWithCenteredTextApi,
+}

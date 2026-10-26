@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+cd "$script_dir"
+
+source ../util/setup.sh
+
+set -xe
+
+q "delete from person"
+q "delete from club"
+
+../util/create-user.sh user1 0 0
+../util/create-user.sh user2 0 0
+
+user2_id=$(q "select id from person where name = 'user2'")
+
+user2_uuid=$(q "select uuid from person where name = 'user2'")
+
+q "update person set privacy_verification_level_id = 1"
+
+assume_role user1
+
+response=$(
+  c GET /prospect-profile/$user2_uuid \
+    | jq '.seconds_since_last_online = null | .seconds_since_sign_up = null')
+
+expected=$(jq -r . << EOF
+{
+  "about": "",
+  "advertiser_friendly": false,
+  "age": 26,
+  "age_preference": {
+    "max_age": 30,
+    "min_age": 22
+  },
+  "audio_bio_uuid": null,
+  "body_type": null,
+  "count_answers": 0,
+  "drinking": null,
+  "drugs": null,
+  "education": null,
+  "ethnicity": null,
+  "exercise": null,
+  "flair": [
+    "gold"
+  ],
+  "gender": "Other",
+  "gender_preference": [
+    "Man",
+    "Woman",
+    "Agender",
+    "Femboy",
+    "Intersex",
+    "Non-binary",
+    "Transgender",
+    "Trans woman",
+    "Trans man",
+    "Other"
+  ],
+  "gets_reply_percentage": null,
+  "gives_reply_percentage": null,
+  "has_kids": null,
+  "height_cm": null,
+  "is_skipped": false,
+  "location": "New York, New York, United States",
+  "long_distance": null,
+  "looking_for": [],
+  "match_percentage": 50,
+  "mutual_clubs": [],
+  "name": "user2",
+  "occupation": null,
+  "orientation": null,
+  "other_clubs": [],
+  "person_id": $user2_id,
+  "person_uuid": "$user2_uuid",
+  "photo_blurhashes": [],
+  "photo_extra_exts": [],
+  "photo_geometries": [],
+  "photo_uuids": [],
+  "photo_verifications": [],
+  "relationship_status": null,
+  "religion": null,
+  "seconds_since_last_online": null,
+  "seconds_since_sign_up": null,
+  "show_my_looking_for": "Yes",
+  "smoking": null,
+  "spotify_artists": [],
+  "star_sign": null,
+  "theme": {
+    "background_color": "#ffffff",
+    "body_color": "#000000",
+    "title_color": "#000000"
+  },
+  "url_slug": "user2",
+  "verified_age": false,
+  "verified_ethnicity": false,
+  "verified_gender": false,
+  "wants_kids": null
+}
+EOF
+)
+
+diff <(echo "$response") <(echo "$expected")
+
+# Location precision is enforced by the profile query for both signed-in and
+# anonymous public-profile viewers.
+q "update person
+   set show_my_location_id = (
+     select id from yes_country_only_no where name = 'Country only')
+   where id = $user2_id"
+
+[[ "$(c GET /prospect-profile/$user2_uuid | jq -r '.location')" == "United States" ]]
+
+q "update person set public_profile = true where id = $user2_id"
+[[ "$(SESSION_TOKEN="" c GET /prospect-profile/$user2_uuid | jq -r '.location')" == "United States" ]]
+
+q "update person
+   set public_profile = false,
+       show_my_location_id = (
+         select id from yes_country_only_no where name = 'No')
+   where id = $user2_id"
+[[ "$(c GET /prospect-profile/$user2_uuid | jq -r '.location')" == "null" ]]
+
+q "update person
+   set show_my_location_id = (
+     select id from yes_country_only_no where name = 'Yes')
+   where id = $user2_id"
+
+
+assume_role user1
+jc POST /join-club -d '{ "name": "my-club-shared-1" }'
+jc POST /join-club -d '{ "name": "my-club-shared-2" }'
+jc POST /join-club -d '{ "name": "my-club-unshared-10" }'
+jc POST /join-club -d '{ "name": "my-club-unshared-20" }'
+
+assume_role user2
+jc POST /join-club -d '{ "name": "my-club-shared-1" }'
+jc POST /join-club -d '{ "name": "my-club-shared-2" }'
+jc POST /join-club -d '{ "name": "my-club-unshared-11" }'
+jc POST /join-club -d '{ "name": "my-club-unshared-21" }'
+
+assume_role user1
+
+response=$(
+  c GET /prospect-profile/$user2_uuid \
+    | jq '.seconds_since_last_online = null | .seconds_since_sign_up = null')
+
+expected=$(jq -r . << EOF
+{
+  "about": "",
+  "advertiser_friendly": false,
+  "age": 26,
+  "age_preference": {
+    "max_age": 30,
+    "min_age": 22
+  },
+  "audio_bio_uuid": null,
+  "body_type": null,
+  "count_answers": 0,
+  "drinking": null,
+  "drugs": null,
+  "education": null,
+  "ethnicity": null,
+  "exercise": null,
+  "flair": [
+    "gold"
+  ],
+  "gender": "Other",
+  "gender_preference": [
+    "Man",
+    "Woman",
+    "Agender",
+    "Femboy",
+    "Intersex",
+    "Non-binary",
+    "Transgender",
+    "Trans woman",
+    "Trans man",
+    "Other"
+  ],
+  "gets_reply_percentage": null,
+  "gives_reply_percentage": null,
+  "has_kids": null,
+  "height_cm": null,
+  "is_skipped": false,
+  "location": "New York, New York, United States",
+  "long_distance": null,
+  "looking_for": [],
+  "match_percentage": 50,
+  "mutual_clubs": ["my-club-shared-1", "my-club-shared-2"],
+  "name": "user2",
+  "occupation": null,
+  "orientation": null,
+  "other_clubs": ["my-club-unshared-11", "my-club-unshared-21"],
+  "person_id": $user2_id,
+  "person_uuid": "$user2_uuid",
+  "photo_blurhashes": [],
+  "photo_extra_exts": [],
+  "photo_geometries": [],
+  "photo_uuids": [],
+  "photo_verifications": [],
+  "relationship_status": null,
+  "religion": null,
+  "seconds_since_last_online": null,
+  "seconds_since_sign_up": null,
+  "show_my_looking_for": "Yes",
+  "smoking": null,
+  "spotify_artists": [],
+  "star_sign": null,
+  "theme": {
+    "background_color": "#ffffff",
+    "body_color": "#000000",
+    "title_color": "#000000"
+  },
+  "url_slug": "user2",
+  "verified_age": false,
+  "verified_ethnicity": false,
+  "verified_gender": false,
+  "wants_kids": null
+}
+EOF
+)
+
+diff <(echo "$response") <(echo "$expected")
+
+
+
+q "update person set sign_up_time = now() - interval '4 days'"
+
+# User 2 messaged 5 people and got one reply. The chat path maintains these
+# counters; xmpp-reply-counters.sh covers the classification that moves them.
+q "
+update person set
+  count_intros_received = 0,
+  count_intros_received_with_reply = 0,
+  count_intros_sent = 5,
+  count_intros_sent_with_reply = 1
+where id = $user2_id
+"
+
+gets_reply_percentage=$(
+  c GET /prospect-profile/$user2_uuid \
+    | jq '.gets_reply_percentage')
+
+gives_reply_percentage=$(
+  c GET /prospect-profile/$user2_uuid \
+    | jq '.gives_reply_percentage')
+
+[[ "$gets_reply_percentage" = '20.0' ]]
+
+[[ "$gives_reply_percentage" = 'null' ]]
+
+
+
+assume_role user2
+jc PATCH /profile-info -d '{ "looking_for": ["Marriage", "Friends"] }'
+assume_role user1
+
+[[ "$(c GET /prospect-profile/$user2_uuid | jq -c .looking_for)" \
+  = '["Friends","Marriage"]' ]]
+
+
+
+# When user2 hides their "Looking For" section, the dating-preference fields are
+# withheld from the profile and the `show_my_looking_for` flag flips to "No".
+q "update person set show_my_looking_for = false where name = 'user2'"
+
+hidden_looking_for=$(
+  c GET /prospect-profile/$user2_uuid \
+    | jq -c '{
+        show_my_looking_for,
+        gender_preference,
+        age_preference,
+        looking_for,
+        long_distance
+      }')
+
+[[ "$hidden_looking_for" = '{"show_my_looking_for":"No","gender_preference":[],"age_preference":null,"looking_for":[],"long_distance":null}' ]]
+
+
+
+# User 2 got 5 intros and replied to one
+q "
+update person set
+  count_intros_received = 5,
+  count_intros_received_with_reply = 1,
+  count_intros_sent = 0,
+  count_intros_sent_with_reply = 0
+where id = $user2_id
+"
+
+gets_reply_percentage=$(
+  c GET /prospect-profile/$user2_uuid \
+    | jq '.gets_reply_percentage')
+
+gives_reply_percentage=$(
+  c GET /prospect-profile/$user2_uuid \
+    | jq '.gives_reply_percentage')
+
+[[ "$gets_reply_percentage" = 'null' ]]
+
+[[ "$gives_reply_percentage" = '20.0' ]]
+
+# The expand animation can't run without the photo's geometry, and the field
+# going missing from the response is invisible to the client: it just quietly
+# stops animating. `rand_image` uploads a 100x100 square, so the crop is the
+# whole photo.
+../util/create-user.sh user7 0 1
+
+user7_uuid=$(q "select uuid from person where name = 'user7'")
+
+assume_role user1
+
+photo_geometries=$(
+  c GET /prospect-profile/$user7_uuid \
+    | jq -c '.photo_geometries | map({width, height, crop_top, crop_left})')
+
+[[ "$photo_geometries" = '[{"width":100,"height":100,"crop_top":0,"crop_left":0}]' ]]

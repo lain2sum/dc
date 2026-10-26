@@ -1,0 +1,939 @@
+import {
+  useCallback,
+  useEffect,
+  useState,
+} from 'react';
+import {
+  Linking,
+  Platform,
+  StyleSheet,
+  View,
+} from 'react-native';
+import { DefaultText } from '../default-text';
+import { Image } from 'expo-image';
+import { IMAGES_URL } from '../../env/env';
+import { AutoResizingGif } from '../auto-resizing-gif';
+import { isMobile } from '../../util/util';
+import { AudioPlayer } from '../audio-player';
+import { MessageStatus } from '../../chat/application-layer';
+import { useMessage } from '../../chat/application-layer/hooks/message';
+import {
+  sendReactionAndNotify,
+  useReaction,
+} from '../../chat/application-layer/hooks/reaction';
+import { onReceiveMessage, Message } from '../../chat/application-layer';
+import { Gesture, GestureDetector, HandlerStateChangeEvent, TapGestureHandler, TapGestureHandlerEventPayload, State } from 'react-native-gesture-handler';
+import Animated, {
+  cancelAnimation,
+  Easing,
+  runOnJS,
+  useAnimatedReaction,
+  useAnimatedStyle,
+  useSharedValue,
+  withDelay,
+  withRepeat,
+  withSequence,
+  withTiming,
+} from 'react-native-reanimated';
+import type { SharedValue } from 'react-native-reanimated';
+import {
+  setQuote,
+  parseMarkdown,
+  QuoteBlock,
+  stripLeadingQuoteBlock,
+  TextBlock,
+} from './quote';
+import { usePartnerAnswer } from '../../chat/application-layer/hooks/partner-answer';
+import { AnsweredQuizCard } from '../quiz-card';
+import * as Haptics from 'expo-haptics';
+import { useSignedInUser } from '../../events/signed-in-user';
+import { FontAwesomeIcon } from '@fortawesome/react-native-fontawesome';
+import { faReply } from '@fortawesome/free-solid-svg-icons/faReply';
+import { useNavigation } from '@react-navigation/native';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import type { RootParamList } from '../../navigation/linking';
+import { assertNever, formatCount } from '../../util/util';
+import { isGifUrl } from '../../util/gif';
+import { useAppTheme } from '../../app-theme/app-theme';
+import {
+  ReactionChip,
+  ReactionMenu,
+} from './reaction-controls';
+import { useAnchorMeasurement } from '../anchored-overlay';
+import { notify } from '../../events/events';
+import {
+  ShowEmojiPickerEvent,
+} from '../modal/emoji-picker-modal';
+import { MessageReceipt, ReceiptText } from './message-receipt';
+
+const currentUserBackgroundColor = '#70f';
+
+const defaultTextColor = 'black';
+
+const defaultFontSize = 15;
+
+const avatarSize = 24;
+
+const avatarGap = 5;
+
+const isEmojiOnly = (str: string): boolean => {
+  const emojiRegex = /^\p{Emoji_Presentation}+$/u;
+  return emojiRegex.test(str);
+}
+
+const haptics = () => {
+  if (Platform.OS !== 'web') {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+  }
+};
+
+const Avatar = ({ avatarUuid }: { avatarUuid: string }) => {
+  return (
+    <Image
+      source={{ uri: `${IMAGES_URL}/450-${avatarUuid}.jpg` }}
+      transition={150}
+      style={{
+        width: avatarSize,
+        height: avatarSize,
+        borderRadius: 9999,
+      }}
+    />
+  );
+};
+
+const FormattedQuoteBlock = ({
+  block,
+  fontSize,
+  backgroundColor,
+}: {
+  block: QuoteBlock,
+  fontSize: number,
+  backgroundColor: string,
+}) => {
+  return (
+    <DefaultText
+      selectable={!isMobile()}
+      style={{
+        fontSize,
+        paddingLeft: 7,
+        paddingRight: 10,
+        paddingVertical: 8,
+        borderLeftWidth: 6,
+        borderColor: 'black',
+        backgroundColor,
+        color: 'black',
+        borderRadius: 4,
+      }}
+    >
+      {block.type === "quote" && block?.attribution &&
+        <DefaultText
+          style={{
+            color: 'black',
+            fontWeight: '700',
+          }}
+        >
+          {block.attribution}{'\n'}
+        </DefaultText>
+      }
+      {block.text}
+    </DefaultText>
+  );
+};
+
+const FormattedTextBlock = ({
+  block,
+  color,
+  fontSize,
+}: {
+  block: TextBlock,
+  color: string,
+  fontSize: number,
+}) => {
+  return (
+    <>
+      {block.tokens.map((token, i) => {
+        if (token.kind === 'text') {
+          return (
+            <DefaultText key={i} selectable={!isMobile()} style={{ color, fontSize }}>
+              {token.value}
+            </DefaultText>
+          );
+        } else if (token.kind === 'link') {
+          const openLink = (url: string) => {
+            Linking.openURL(url);
+          };
+
+          const gesture = Gesture.Tap().onEnd(() => {
+            runOnJS(openLink)(token.url);
+          });
+
+          return (
+            <GestureDetector key={i} gesture={gesture}>
+              <View>
+                <DefaultText
+                  key={i}
+                  style={{
+                    color,
+                    fontSize,
+                    ...styles.hyperlink,
+                  }}
+                >
+                  {token.display}
+                </DefaultText>
+              </View>
+            </GestureDetector>
+          );
+        } else {
+          return assertNever(token);
+        }
+      })}
+    </>
+  );
+};
+
+const FormattedText = ({
+  text,
+  color = defaultTextColor,
+  fontSize = defaultFontSize,
+  backgroundColor = 'rgba(255, 255, 255, 0.8)',
+}: {
+  text: string
+  color?: string,
+  fontSize?: number,
+  backgroundColor?: string,
+}) => {
+  const blocks = parseMarkdown(text);
+
+  return (
+    <>
+      {blocks.map((block, i) => {
+        if (block.type === 'quote') {
+          return <FormattedQuoteBlock
+            key={i}
+            block={block}
+            fontSize={fontSize}
+            backgroundColor={backgroundColor}
+          />
+        } else if (block.type === 'text') {
+          return <FormattedTextBlock
+            key={i}
+            block={block}
+            color={color}
+            fontSize={fontSize}
+          />
+        } else {
+          return assertNever(block);
+        }
+      })}
+    </>
+  );
+};
+
+const MessageStatusComponent = ({
+  messageStatus,
+  name = 'them',
+  usedCount = 0,
+}:
+  | { name: string | undefined, messageStatus: 'not unique', usedCount: number }
+  | { name: string | undefined, messageStatus: Exclude<MessageStatus, 'not unique'>, usedCount?: never }
+) => {
+
+  const verificationStatuses: MessageStatus[] =  [
+    'rate-limited-1day-unverified-basics',
+    'rate-limited-1day-unverified-photos',
+    'age-verification',
+  ];
+
+  const isPressable = verificationStatuses.includes(messageStatus);
+
+  const navigation = useNavigation<NativeStackNavigationProp<RootParamList>>();
+
+  const onHandlerStateChange = useCallback(({ nativeEvent }: HandlerStateChangeEvent<TapGestureHandlerEventPayload>) => {
+    if (!isPressable) {
+      return;
+    }
+
+    if (nativeEvent.state !== State.ACTIVE) {
+      return;
+    }
+
+    return navigation.navigate('Home', { screen: 'Profile' });
+  }, [isPressable]);
+
+  const verificationMessageText = ` Verification is free and takes just a few minutes. Press here to start.`;
+
+  const messageTexts: Record<MessageStatus, string> = {
+    'sending': '',
+    'sent': '',
+    'timeout': 'Message not delivered. Are you online?',
+    'rate-limited-1day-unverified-basics': `You’ve used today’s daily intro limit! Message ${name} tomorrow or unlock extra daily intros by getting verified.` + verificationMessageText,
+    'rate-limited-1day-unverified-photos': `You’ve used today’s daily intro limit! Message ${name} tomorrow or unlock extra daily intros by verifying your photos.` + verificationMessageText,
+    'rate-limited-1day': `You’ve used today’s daily intro limit! Try messaging ${name} tomorrow...`,
+    'voice-intro': `Voice messages aren’t allowed in intros`,
+    'spam': `We think that might be spam. Try sending ${name} a different message.`,
+    'offensive': `Intros can’t be too rude. Try sending ${name} a different message.`,
+    'age-verification': `Verification is required to chat.` + verificationMessageText,
+    'blocked': name + ' is unavailable right now. Try messaging someone else!',
+    'not unique': `That intro’s been used ${usedCount === 1 ? 'once before' : `${formatCount(usedCount)} times`} on Duolicious. Send ${name} a unique message instead!`,
+    'too long': 'That message is too big! 😩',
+    'server-error': 'Our server went boom. Please contact support@duolicious.app',
+  };
+
+  const messageText = messageTexts[messageStatus];
+
+  if (messageText === '') {
+    return <></>;
+  }
+
+  return (
+    <TapGestureHandler onHandlerStateChange={onHandlerStateChange} >
+      <View
+        style={{
+          borderRadius: 10,
+          backgroundColor: 'black',
+          padding: 10,
+          maxWidth: '80%',
+          cursor: isPressable ? 'pointer' : undefined,
+        }}
+      >
+        <DefaultText style={{
+          color: 'white',
+          fontWeight: 700,
+        }}>
+          {messageText}
+        </DefaultText>
+      </View>
+    </TapGestureHandler>
+  );
+};
+
+const ChatMessage = ({
+  messageId,
+  personUuid,
+  name,
+  avatarUuid,
+  isLastMessage,
+}: {
+  messageId: string
+  personUuid: string
+  name: string | undefined
+  avatarUuid: string | null | undefined
+  isLastMessage: boolean
+}) => {
+  const { appTheme } = useAppTheme();
+  const opacity = useSharedValue(0);
+
+  const translateX = useSharedValue(0);
+  const dragTriggered = useSharedValue(false);
+
+  const [isHovering, setIsHovering] = useState(false);
+  const [isTimestampShown, setIsTimestampShown] = useState(false);
+  const [showReactionBar, setShowReactionBar] = useState(false);
+  const [speechBubbleImageError, setSpeechBubbleImageError] = useState(false);
+  const [isGifLoaded, setIsGifLoaded] = useState(false);
+  const {
+    anchor: reactionAnchor,
+    anchorRef: reactionAnchorRef,
+    measureAnchor: measureReactionAnchor,
+  } = useAnchorMeasurement();
+  const message = useMessage(messageId);
+  const [signedInUser] = useSignedInUser();
+
+  const chatMessage =
+    message && message.message.type !== 'typing'
+      ? message.message
+      : undefined;
+
+  const isDelivered = message?.status === 'sent';
+
+  const hasReceipt =
+    isLastMessage &&
+    !!chatMessage?.fromCurrentUser &&
+    (isDelivered || message?.status === 'sending');
+
+  const deliveredAt =
+    hasReceipt && isDelivered && chatMessage ? chatMessage.timestamp : null;
+
+  const [hadReceipt, setHadReceipt] = useState(hasReceipt);
+
+  // Gaining or losing the slot makes a press about it stale, so it's dropped
+  // rather than carried over to whatever the bubble shows next.
+  if (hasReceipt !== hadReceipt) {
+    setHadReceipt(hasReceipt);
+    setIsTimestampShown(false);
+  }
+
+  const mamId = chatMessage?.mamId;
+
+  const reaction = useReaction(mamId);
+
+  const questionCard =
+    chatMessage?.type === 'chat-text' &&
+    chatMessage.questionId !== undefined &&
+    chatMessage.question !== undefined &&
+    chatMessage.questionTopic !== undefined
+      ? {
+          questionId: chatMessage.questionId,
+          question: chatMessage.question,
+          topic: chatMessage.questionTopic,
+        }
+      : undefined;
+
+  // The conversation partner's answer, regardless of who sent the message;
+  // updates live via `duo_answer_update`
+  const partnerAnswer = usePartnerAnswer(personUuid, questionCard?.questionId);
+
+  // When the quiz card renders, it replaces the message's leading blockquote
+  // (the card's fallback presentation), leaving just the typed text
+  const bubbleText =
+    chatMessage?.type !== 'chat-text' ? '' :
+    questionCard === undefined ? chatMessage.text :
+    stripLeadingQuoteBlock(chatMessage.text);
+
+  const canReact = !!chatMessage && !chatMessage.fromCurrentUser && !!mamId;
+
+  const pickReaction = useCallback((emoji: string) => {
+    setShowReactionBar(false);
+
+    if (!mamId) {
+      return;
+    }
+
+    const next = reaction?.emoji === emoji ? '' : emoji;
+
+    sendReactionAndNotify(mamId, next);
+  }, [mamId, reaction?.emoji, setShowReactionBar]);
+
+  const clearOwnReaction = useCallback(() => {
+    if (!mamId || reaction?.reactionFrom !== 'self') {
+      return;
+    }
+
+    sendReactionAndNotify(mamId, '');
+  }, [mamId, reaction?.reactionFrom]);
+
+  const openReactionBar = useCallback(() => {
+    haptics();
+
+    measureReactionAnchor();
+    setShowReactionBar(true);
+  }, [measureReactionAnchor, setShowReactionBar]);
+
+  const openEmojiPicker = useCallback(() => {
+    setShowReactionBar(false);
+
+    if (!mamId) {
+      return;
+    }
+
+    if (isMobile()) {
+      notify<ShowEmojiPickerEvent>('show-emoji-picker', { mamId });
+    } else {
+      // The hover path never measures the anchor before this point
+      measureReactionAnchor((measurement) =>
+        notify<ShowEmojiPickerEvent>(
+          'show-emoji-picker',
+          { mamId, anchor: measurement },
+        )
+      );
+    }
+  }, [mamId, measureReactionAnchor, setShowReactionBar]);
+
+  const doRenderUrlAsImage = (
+    message &&
+    message.message.type === 'chat-text' &&
+    isGifUrl(message.message.text) &&
+    !speechBubbleImageError
+  );
+
+  const backgroundColor = (() => {
+    if (!message) {
+      return 'transparent';
+    } else if (message.message.type !== 'chat-text') {
+      return 'transparent';
+    } else if (doRenderUrlAsImage) {
+      return 'transparent';
+    } else if (isEmojiOnly(bubbleText)) {
+      return 'transparent';
+    } else if (message.message.fromCurrentUser) {
+      return currentUserBackgroundColor;
+    } else {
+      return appTheme.speechBubbleOtherUserBackgroundColor;
+    }
+  })();
+
+  const textColor =
+    !!message &&
+    message.message.type === 'chat-text' &&
+    message.message.fromCurrentUser
+    ? 'white'
+    : appTheme.speechBubbleOtherUserColor;
+
+  const toggleTimestamp = useCallback(() => {
+    if (window.getSelection?.()?.toString()) {
+      return;
+    }
+
+    setShowReactionBar(false);
+    setIsTimestampShown(t => !t);
+  }, [setIsTimestampShown, setShowReactionBar]);
+
+  const setQuoteToThisSpeechBubble = useCallback(() => {
+    if (!message) {
+      return;
+    }
+
+    if (message.message.type !== 'chat-text') {
+      return;
+    }
+
+    haptics();
+
+    const text = message.message.text;
+
+    const attribution = !!message && message.message.fromCurrentUser
+      ? signedInUser?.name
+      : name;
+
+    if (attribution) {
+      setQuote({ text, attribution })
+    }
+  }, [message, signedInUser?.name, name])
+
+  const isTextBubble = !!message && message.message.type === 'chat-text';
+
+  const canPan = isMobile() && !doRenderUrlAsImage && isTextBubble;
+
+  const canTap = isTextBubble && (!doRenderUrlAsImage || isGifLoaded);
+
+  const canLongPress = isMobile() && canReact;
+
+  const pan = Gesture
+    .Pan()
+    .activeOffsetX([-10, 10])
+    .onStart(() => {
+      dragTriggered.value = false;
+    })
+    .onUpdate(evt => {
+      const x = evt.translationX
+
+      translateX.value = x;
+
+      if (!dragTriggered.value && Math.abs(x) > 50) {
+        dragTriggered.value = true;
+        runOnJS(setQuoteToThisSpeechBubble)();
+      }
+    })
+    .onEnd(() => {
+      dragTriggered.value = false;
+      translateX.value = withTiming(0)
+    });
+
+  const tap = Gesture
+    .Tap()
+    .maxDistance(10)
+    .enabled(canTap)
+    .onEnd(() => {
+      runOnJS(toggleTimestamp)()
+    });
+
+  const longPress = Gesture
+    .LongPress()
+    .minDuration(300)
+    .onStart(() => {
+      runOnJS(openReactionBar)()
+    });
+
+  // RNGH's web orchestrator never reports failure for a disabled handler, so a
+  // disabled handler blocks every handler after it in the composition. Only
+  // live handlers go in, and `tap` goes last so nothing can block it.
+  const gesture = Gesture.Exclusive(
+    ...(canLongPress ? [longPress] : []),
+    ...(canPan ? [pan] : []),
+    tap,
+  );
+
+  const gestureStyle = useAnimatedStyle(() => ({
+    transform: [{ translateX: translateX.value }],
+  }));
+
+  const animatedContainerStyle = useAnimatedStyle(() => ({
+    opacity: opacity.value,
+  }));
+
+  useEffect(() => {
+    if (message?.status === 'sent') {
+      opacity.set(withTiming(1.0));
+    } else {
+      opacity.set(0.3);
+    }
+  }, [message?.status === 'sent']);
+
+  if (!message) {
+    return <></>;
+  }
+
+  if (message.message.type === 'typing') {
+    return <></>;
+  }
+
+  const { fromCurrentUser } = message.message;
+  const shownAvatarUuid = fromCurrentUser ? undefined : avatarUuid;
+
+  return (
+    <View
+      style={[
+        {
+          paddingLeft: 10,
+          paddingRight: 10,
+          alignItems: fromCurrentUser ? 'flex-end' : 'flex-start',
+          width: '100%',
+          gap: 4,
+          // The zIndex bump is only for the hover (non-modal) reaction bar,
+          // which must stack above later sibling bubbles. It must not depend
+          // on `showReactionBar`: that bar renders inside a `Modal`, and on
+          // Android, changing an ancestor's zIndex restructures the native
+          // view hierarchy under it, which makes the Modal's dialog (and the
+          // bar in it) blink for a frame.
+          zIndex: isHovering ? 1 : 0,
+        },
+      ]}
+    >
+      {questionCard &&
+        <View
+          style={{
+            width: '100%',
+            maxWidth: 450,
+            alignSelf: fromCurrentUser ? 'flex-end' : 'flex-start',
+          }}
+        >
+          <AnsweredQuizCard
+            questionNumber={questionCard.questionId}
+            topic={questionCard.topic}
+            user1={name ?? 'They'}
+            answer1={partnerAnswer}
+            user2="You"
+          >
+            {questionCard.question}
+          </AnsweredQuizCard>
+        </View>
+      }
+      <View
+        style={{
+          position: 'relative',
+          width: '100%',
+          alignItems: fromCurrentUser ? 'flex-end' : 'flex-start',
+          zIndex: isHovering ? 1 : 0,
+        }}
+        /* @ts-ignore */
+        onContextMenu={
+          canReact && isMobile() && Platform.OS === 'web'
+            ? (e: any) => e.preventDefault() // eslint-disable-line @typescript-eslint/no-explicit-any
+            : undefined
+        }
+      >
+        <ReactionMenu
+          visible={canReact && (showReactionBar || (isHovering && !isMobile()))}
+          showDismissLayer={canReact && showReactionBar}
+          anchor={reactionAnchor}
+          selected={reaction?.emoji}
+          onPick={pickReaction}
+          onOpenPicker={openEmojiPicker}
+          onDismiss={() => setShowReactionBar(false)}
+          onHoverChange={isMobile() ? undefined : setIsHovering}
+        />
+        <GestureDetector
+          gesture={gesture}
+          touchAction="pan-y"
+        >
+          <Animated.View
+            ref={reactionAnchorRef}
+            style={[
+              {
+                flexDirection: 'row',
+                gap: avatarGap,
+                alignItems: 'flex-end',
+                ...(doRenderUrlAsImage ? {
+                  width: '66%',
+                }: {
+                  maxWidth: '80%',
+                })
+              },
+              animatedContainerStyle,
+              gestureStyle
+            ]}
+          >
+            {shownAvatarUuid &&
+              <Avatar avatarUuid={shownAvatarUuid} />
+            }
+            {message.message.type === 'chat-text' && bubbleText.length > 0 &&
+              <View
+                style={{
+                  borderRadius: 10,
+                  backgroundColor: backgroundColor,
+                  gap: 10,
+                  ...(doRenderUrlAsImage ? {
+                    width: '100%',
+                  }: {
+                    padding: 10,
+                    flexShrink: 1,
+                  }),
+                  overflow: 'hidden',
+                }}
+                /* @ts-ignore */
+                onMouseEnter={() => {
+                  measureReactionAnchor();
+                  setIsHovering(true);
+                }}
+                onMouseLeave={() => setIsHovering(false)}
+              >
+                {doRenderUrlAsImage &&
+                  <AutoResizingGif
+                    uri={message.message.text}
+                    onError={() => setSpeechBubbleImageError(true)}
+                    requirePress={isMobile()}
+                    onLoadedChange={setIsGifLoaded}
+                  />
+                }
+                {!doRenderUrlAsImage &&
+                  <FormattedText
+                    text={bubbleText}
+                    color={textColor}
+                    fontSize={isEmojiOnly(bubbleText) ? 50 : defaultFontSize}
+                  />
+                }
+                {!doRenderUrlAsImage && !isMobile() &&
+                  <View
+                    style={{
+                      position: 'absolute',
+                      top: 0,
+                      right: 0,
+                      height: 32,
+                      width: 32,
+                      opacity: isHovering ? 1 : 0,
+                      borderBottomLeftRadius: 10,
+                      backgroundColor,
+                      justifyContent: 'center',
+                      alignItems: 'center',
+                      cursor: 'pointer',
+                    }}
+                    /* @ts-ignore */
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setQuoteToThisSpeechBubble();
+                    }}
+                  >
+                    <FontAwesomeIcon
+                      icon={faReply}
+                      size={20}
+                      color={textColor}
+                    />
+                  </View>
+                }
+              </View>
+            }
+            {message.message.type === 'chat-audio' &&
+              <AudioPlayer
+                sending={message.status === 'sending'}
+                uuid={message.message.audioUuid}
+                presentation="conversation"
+                onPressBody={toggleTimestamp}
+              />
+            }
+          </Animated.View>
+        </GestureDetector>
+      </View>
+      {reaction &&
+        <ReactionChip
+          emoji={reaction.emoji}
+          onPress={reaction.reactionFrom === 'self' ? clearOwnReaction : undefined}
+          style={{
+            // Tuck the chip into the bubble’s bottom edge, clear of the avatar
+            alignSelf: fromCurrentUser ? 'flex-end' : 'flex-start',
+            marginTop: -8,
+            marginLeft: shownAvatarUuid ? avatarSize + avatarGap : 0,
+            zIndex: 2,
+          }}
+        />
+      }
+      {hasReceipt &&
+        <MessageReceipt
+          personUuid={personUuid}
+          deliveredAt={deliveredAt}
+          hasGold={!!signedInUser?.hasGold}
+          pressToggle={isTimestampShown}
+        />
+      }
+      {!hasReceipt && isTimestampShown && isDelivered &&
+        <DefaultText
+          selectable={true}
+          style={{
+            fontSize: appTheme.timestampFontSize,
+            alignSelf: fromCurrentUser ? 'flex-end' : 'flex-start',
+            color: appTheme.hintColor,
+          }}
+        >
+          <ReceiptText
+            content={{
+              kind: 'delivered',
+              timestamp: message.message.timestamp,
+            }}
+          />
+        </DefaultText>
+      }
+      <MessageStatusComponent
+        name={name}
+        {...(message.status === 'not unique'
+          ? { messageStatus: message.status, usedCount: message.usedCount }
+          : { messageStatus: message.status }
+        )}
+      />
+    </View>
+  );
+};
+
+const Dot = ({
+  phaseOffset,
+  progress,
+  color,
+}: {
+  phaseOffset: number,
+  progress: SharedValue<number>,
+  color: string,
+}) => {
+  const animatedStyle = useAnimatedStyle(() => ({
+    opacity: 0.5 + 0.5 * Math.sin(2 * Math.PI * (phaseOffset - progress.value))
+  }));
+  return <Animated.View
+    style={[
+      styles.dot,
+      { backgroundColor: color },
+      animatedStyle
+    ]}
+  />;
+};
+
+const TypingIndicator = ({
+  personUuid,
+  avatarUuid,
+}: {
+  personUuid: string
+  avatarUuid: string | null | undefined
+}) => {
+  const { appTheme } = useAppTheme();
+
+  const opacity = useSharedValue(0.0);
+  const progress = useSharedValue(0);
+
+  useEffect(() => {
+    return onReceiveMessage(
+      (message: Message) => {
+        // Cancel any ongoing animation (including a pending fade-out)
+        cancelAnimation(opacity);
+
+        if (message.type === 'typing') {
+          opacity.value = withSequence(
+            withTiming(1),
+            withDelay(5000, withTiming(0))
+          );
+        } else {
+          opacity.value = withTiming(0);
+        }
+      },
+      personUuid
+    );
+  }, [personUuid]);
+
+  // Only run the dot animation while visible
+  useAnimatedReaction(
+    () => opacity.value,
+    (current, previous) => {
+      if (current > 0 && (previous ?? 0) === 0) {
+        // Start the repeating animation when bubble becomes visible
+        progress.value = withRepeat(
+          withTiming(1, { duration: 2000, easing: Easing.linear }),
+          -1,
+          false
+        );
+      } else if (current === 0 && (previous ?? 0) > 0) {
+        // Stop the animation when bubble is no longer visible
+        cancelAnimation(progress);
+        progress.value = 0;
+      }
+    }
+  );
+
+  const animatedContainerStyle = useAnimatedStyle(() => ({
+    opacity: opacity.value,
+  }));
+
+  return (
+    <Animated.View style={[styles.typingIndicatorContainer, animatedContainerStyle]}>
+      <View
+        style={{
+          flexDirection: 'row',
+          gap: avatarGap,
+          alignItems: 'flex-end',
+          maxWidth: '80%',
+        }}
+      >
+        {avatarUuid &&
+          <Avatar avatarUuid={avatarUuid} />
+        }
+        <View
+          style={{
+            borderRadius: 10,
+            backgroundColor: appTheme.speechBubbleOtherUserBackgroundColor,
+            gap: 5,
+            paddingVertical: 14,
+            paddingHorizontal: 12,
+            flexShrink: 1,
+            flexDirection: 'row',
+            alignItems: 'center',
+          }}
+        >
+          <Dot
+            phaseOffset={0}
+            progress={progress}
+            color={appTheme.speechBubbleOtherUserColor}
+          />
+          <Dot
+            phaseOffset={0.33}
+            progress={progress}
+            color={appTheme.speechBubbleOtherUserColor}
+          />
+          <Dot
+            phaseOffset={0.66}
+            progress={progress}
+            color={appTheme.speechBubbleOtherUserColor}
+          />
+        </View>
+      </View>
+    </Animated.View>
+  );
+};
+
+const styles = StyleSheet.create({
+  typingIndicatorContainer: {
+    paddingLeft: 10,
+    paddingRight: 10,
+    alignItems: 'flex-start',
+    flex: 1,
+    gap: 4,
+  },
+  dot: {
+    width: 10,
+    height: 10,
+    borderRadius: 999,
+  },
+  hyperlink: {
+    textDecorationLine: 'underline',
+    cursor: 'pointer',
+  }
+});
+
+export {
+  ChatMessage,
+  FormattedText,
+  TypingIndicator,
+};

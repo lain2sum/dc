@@ -1,0 +1,18 @@
+# Root dev stack for the Duolicious monorepo.
+#
+#   docker compose up
+#
+# brings up the full backend (API, cron, Postgres, mock S3, SMTP, ...)
+# plus the frontend web app, so a new contributor can get the whole app
+# running with a single command.
+#
+#   - Frontend (web):  http://localhost:8081
+#   - API health:      http://localhost:5000/health
+#   - MailHog (email): http://localhost:8025
+#   - Mock S3:         http://localhost:9090
+#
+# Requires Docker Compose v2.20+ (for `include`).
+
+include:
+  - backend/docker-compose.yml
+  - frontend/docker-compose.yml

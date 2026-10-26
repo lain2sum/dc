@@ -1,0 +1,317 @@
+services:
+  status:
+    build:
+      context: .
+      dockerfile: status.Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./service/status/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./service/status/index.html:/usr/share/nginx/html/index.html:ro
+
+  postgres:
+    build:
+      context: .
+      dockerfile: postgres.Dockerfile
+    shm_size: 1gb
+    command: >
+      postgres
+      -c shared_preload_libraries=pg_stat_statements
+      -c pg_stat_statements.track=all
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_PASSWORD: password
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+      PGDATA: /var/lib/postgresql/data
+    volumes:
+      - ${POSTGRES_VOLUME:-postgres_test}:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 1s
+      timeout: 1s
+      retries: 60
+
+  api:
+    build:
+      context: .
+      dockerfile: api.Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      firehol:
+        condition: service_started
+    ports:
+      - "5000:5000"
+    volumes:
+      - .:/app:ro
+    environment:
+      DUO_ENV: dev
+
+      # Unit-test discovery runs in this container and imports
+      # service.cron, which fails fast without this or an OpenAI key.
+      DUO_CRON_CLUB_SEO_MOCK_DESCRIPTION: 'A friendly description for this club.'
+
+      DUO_FIREHOL_URL: http://firehol:5070
+
+      # Unreachable, so ASN lookups fail open instantly rather than hitting
+      # the real RIPEstat on every dev sign-up.
+      DUO_RIPE_URL: http://127.0.0.1:1
+
+      DUO_SMTP_HOST: smtp
+      DUO_SMTP_PORT: 1025
+      DUO_SMTP_USER: unused-in-dev-env
+      DUO_SMTP_PASS: unused-in-dev-env
+      DUO_UNSUBSCRIBE_SECRET: dev-unsubscribe-secret
+
+      DUO_REPORT_EMAIL: duolicious@example.com 20 a@example.com 0
+
+      DUO_DB_HOST: postgres
+      DUO_DB_PORT: 5432
+      DUO_DB_USER: postgres
+      DUO_DB_PASS: password
+
+      DUO_CORS_ORIGINS: '*'
+
+      DUO_VAPID_PRIVATE_KEY: "${DUO_VAPID_PRIVATE_KEY:-}"
+      DUO_VAPID_SUBJECT: "${DUO_VAPID_SUBJECT:-mailto:support@duolicious.app}"
+
+      DUO_R2_BUCKET_NAME: s3-mock-bucket
+      DUO_R2_AUDIO_BUCKET_NAME: s3-mock-audio-bucket
+      DUO_R2_ACCT_ID: unused-in-dev-env
+      DUO_R2_ACCESS_KEY_ID: s3-mock-access-key-id
+      DUO_R2_ACCESS_KEY_SECRET: s3-mock-secret-access-key-secret
+
+      DUO_BOTO_ENDPOINT_URL: http://s3mock:9090
+
+      # Social-login OAuth audiences. Real values come from Google Cloud
+      # Console / Apple Developer Portal in production; dummy values let
+      # the API boot in dev without crashing on missing config. Any
+      # actual /sign-in-with-* call will fail token verification.
+      DUO_GOOGLE_CLIENT_IDS: 443037492722-n1lcbdqe2u49ev56b1tv6m087a9muhsd.apps.googleusercontent.com
+      DUO_APPLE_CLIENT_IDS: app.duolicious,app.duolicious.web
+      # Where /auth/apple/callback redirects the user after a web/Android
+      # Apple sign-in. See service/auth/apple_oauth.py.
+      DUO_APPLE_WEB_REDIRECT_URL: http://web.duolicious.app/
+      DUO_APPLE_APEX_REDIRECT_URL: http://duolicious.app/
+      DUO_APPLE_ANDROID_REDIRECT_URL: https://get.duolicious.app/
+
+      DUO_SPOTIFY_CLIENT_ID: dev-spotify-client-id
+      DUO_SPOTIFY_CLIENT_SECRET: dev-spotify-client-secret
+      DUO_SPOTIFY_REDIRECT_URI: http://localhost:5000/spotify/callback
+      DUO_SPOTIFY_AUTHORIZE_URL: http://localhost:3003/authorize
+      DUO_SPOTIFY_TOKEN_URL: http://spotifymock:3003/api/token
+      DUO_SPOTIFY_API_URL: http://spotifymock:3003
+      DUO_SPOTIFY_WEB_REDIRECT_URL: http://localhost:8081/profile
+      DUO_SPOTIFY_APEX_REDIRECT_URL: http://localhost:8081/profile
+      DUO_SPOTIFY_APP_REDIRECT_URL: app.duolicious://spotify
+
+      DUO_DISCORD_CLIENT_ID: ${DUO_DISCORD_CLIENT_ID:-dev-discord-client-id}
+      DUO_DISCORD_CLIENT_SECRET: ${DUO_DISCORD_CLIENT_SECRET:-dev-discord-client-secret}
+      DUO_DISCORD_REDIRECT_URI: ${DUO_DISCORD_REDIRECT_URI:-http://localhost:5000/auth/discord/callback}
+      DUO_DISCORD_AUTHORIZE_URL: ${DUO_DISCORD_AUTHORIZE_URL:-http://localhost:3005/oauth2/authorize}
+      DUO_DISCORD_API_URL: ${DUO_DISCORD_API_URL:-http://discordmock:3005}
+      DUO_DISCORD_WEB_REDIRECT_URL: http://localhost:8081/
+      DUO_DISCORD_APEX_REDIRECT_URL: http://localhost:8081/
+
+      DUO_PAYPAL_API_URL: ${DUO_PAYPAL_API_URL:-http://paypalmock:3004}
+      DUO_PAYPAL_CLIENT_ID: ${DUO_PAYPAL_CLIENT_ID:-dev-paypal-client-id}
+      DUO_PAYPAL_CLIENT_SECRET: ${DUO_PAYPAL_CLIENT_SECRET:-dev-paypal-client-secret}
+      DUO_PAYPAL_WEBHOOK_ID: ${DUO_PAYPAL_WEBHOOK_ID:-WH-DEV}
+      DUO_PAYPAL_RETURN_URL: ${DUO_PAYPAL_RETURN_URL:-http://localhost:5000/paypal/return}
+      DUO_PAYPAL_WEB_REDIRECT_URL: http://localhost:8081/
+      DUO_PAYPAL_APEX_REDIRECT_URL: http://localhost:8081/
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  cron:
+    build:
+      context: .
+      dockerfile: cron.Dockerfile
+    ports:
+      - "8082:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    volumes:
+      - .:/app
+    environment:
+      DUO_SMTP_HOST: smtp
+      DUO_SMTP_PORT: 1025
+      DUO_SMTP_USER: unused-in-dev-env
+      DUO_SMTP_PASS: unused-in-dev-env
+      DUO_UNSUBSCRIBE_SECRET: dev-unsubscribe-secret
+
+      DUO_REPORT_EMAIL: duolicious@example.com 20 a@example.com 0
+
+      DUO_CRON_PROFILE_REPORTER_POLL_SECONDS: 1
+
+      DUO_DB_HOST: postgres
+      DUO_DB_PORT: 5432
+      DUO_DB_USER: postgres
+      DUO_DB_PASS: password
+      DUO_DB_API_NAME: duo_api
+
+      DUO_R2_BUCKET_NAME: s3-mock-bucket
+      DUO_R2_AUDIO_BUCKET_NAME: s3-mock-audio-bucket
+      DUO_R2_ACCT_ID: unused-in-dev-env
+      DUO_R2_ACCESS_KEY_ID: s3-mock-access-key-id
+      DUO_R2_ACCESS_KEY_SECRET: s3-mock-secret-access-key-secret
+
+      DUO_BOTO_ENDPOINT_URL: http://s3mock:9090
+
+      DUO_CRON_EMAIL_POLL_SECONDS: '1'
+
+      DUO_CRON_INSERT_LAST_POLL_SECONDS: '1'
+
+      DUO_CRON_PHOTO_CLEANER_DRY_RUN: ${DUO_CRON_PHOTO_CLEANER_DRY_RUN:-false}
+      DUO_CRON_PHOTO_CLEANER_POLL_SECONDS: '1'
+
+      DUO_CRON_AUDIO_CLEANER_DRY_RUN: ${DUO_CRON_AUDIO_CLEANER_DRY_RUN:-false}
+      DUO_CRON_AUDIO_CLEANER_POLL_SECONDS: '1'
+
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DUO_VERIFICATION_IMAGE_BASE_URL: http://s3mock:9090/s3-mock-bucket
+      DUO_VERIFICATION_MOCK_RESPONSE_FILE: test/input/verification-mock-response-file
+      DUO_CRON_CLUB_SEO_MOCK_DESCRIPTION: 'A friendly description for this club.'
+
+      DUO_CRON_GARBAGE_RECORDS_POLL_SECONDS: '1'
+
+      DUO_CRON_MAX_RANDOM_START_DELAY: '0'
+
+      DUO_SPOTIFY_CLIENT_ID: dev-spotify-client-id
+      DUO_SPOTIFY_CLIENT_SECRET: dev-spotify-client-secret
+      DUO_SPOTIFY_TOKEN_URL: http://spotifymock:3003/api/token
+      DUO_SPOTIFY_API_URL: http://spotifymock:3003
+
+  s3mock:
+    image: adobe/s3mock:3.12.0
+
+    environment:
+      initialBuckets: s3-mock-bucket, s3-mock-audio-bucket
+      AWS_ACCESS_KEY_ID: s3-mock-access-key-id
+      AWS_SECRET_ACCESS_KEY: s3-mock-secret-access-key-secret
+
+    ports:
+      - 9090:9090
+
+  smtp:
+    image: mailhog/mailhog
+
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+
+  chatjsontest:
+    build:
+      context: .
+      dockerfile: nodemock.Dockerfile
+      args:
+        MOCK: chatjsontest
+
+    volumes:
+      - ./test/chatjsontest/index.js:/usr/src/app/index.js
+
+    ports:
+      - "3001:3001"
+
+  pushmock:
+    build:
+      context: .
+      dockerfile: nodemock.Dockerfile
+      args:
+        MOCK: pushmock
+
+    ports:
+      - "3002:3002"
+
+  spotifymock:
+    build:
+      context: .
+      dockerfile: nodemock.Dockerfile
+      args:
+        MOCK: spotifymock
+
+    volumes:
+      - ./test/spotifymock/index.js:/usr/src/app/index.js
+
+    environment:
+      SPOTIFY_MOCK_CLIENT_ID: dev-spotify-client-id
+      SPOTIFY_MOCK_CLIENT_SECRET: dev-spotify-client-secret
+
+    ports:
+      - "3003:3003"
+
+  paypalmock:
+    build:
+      context: .
+      dockerfile: nodemock.Dockerfile
+      args:
+        MOCK: paypalmock
+
+    volumes:
+      - ./test/paypalmock/index.js:/usr/src/app/index.js
+
+    environment:
+      PAYPAL_MOCK_CLIENT_ID: dev-paypal-client-id
+      PAYPAL_MOCK_CLIENT_SECRET: dev-paypal-client-secret
+
+    ports:
+      - "3004:3004"
+
+  discordmock:
+    build:
+      context: .
+      dockerfile: nodemock.Dockerfile
+      args:
+        MOCK: discordmock
+
+    volumes:
+      - ./test/discordmock/index.js:/usr/src/app/index.js
+
+    environment:
+      DISCORD_MOCK_CLIENT_ID: dev-discord-client-id
+      DISCORD_MOCK_CLIENT_SECRET: dev-discord-client-secret
+
+    ports:
+      - "3005:3005"
+
+  firehol:
+    build:
+      context: .
+      dockerfile: firehol.Dockerfile
+    ports:
+      - "5070:5070"
+    volumes:
+      - .:/app:ro
+    # Hot-reload on source changes. watchfiles ships with uvicorn[standard], so
+    # editing service/firehol restarts the server without rebuilding the image.
+    command: ["watchfiles", "python3 service/firehol/__init__.py", "service/firehol"]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5070/health', timeout=2)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  redis:
+    image: "redis:alpine"
+    container_name: redis
+    ports:
+      - "6379:6379"
+
+volumes:
+  postgres_test:
+  postgres_prod:
+
+networks:
+  default:
+    driver: bridge

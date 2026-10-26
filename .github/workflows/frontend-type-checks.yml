@@ -1,0 +1,31 @@
+name: Frontend Type Checks
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - frontend/**
+      - .github/workflows/frontend-type-checks.yml
+  pull_request:
+    paths:
+      - frontend/**
+      - .github/workflows/frontend-type-checks.yml
+
+defaults:
+  run:
+    working-directory: frontend
+
+jobs:
+  test:
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: lts/*
+    - name: Install dependencies
+      run: npm ci
+    - name: Run type checks
+      run: |
+        npm run typecheck

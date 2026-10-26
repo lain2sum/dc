@@ -1,0 +1,1138 @@
+import {
+  Animated,
+  Keyboard,
+  Platform,
+  Text,
+  View,
+  useWindowDimensions,
+} from 'react-native';
+import { IconButton } from './button/icon-button';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import { FontAwesomeIcon } from '@fortawesome/react-native-fontawesome';
+import { faArrowLeft } from '@fortawesome/free-solid-svg-icons/faArrowLeft';
+import { descriptionStyle } from './option-styles';
+import {
+  useEffect,
+  useRef,
+  useState,
+} from 'react';
+import {
+  NativeStackScreenProps,
+  createNativeStackNavigator,
+} from '@react-navigation/native-stack';
+import type { RootParamList, WelcomeParamList } from '../navigation/linking';
+import Ionicons from '@expo/vector-icons/Ionicons';
+import Svg, { Path } from 'react-native-svg';
+import { DefaultText } from './default-text';
+import { LinkText } from './link-text';
+import { DefaultTextInput } from './default-text-input';
+import { ButtonWithCenteredText } from './button/centered-text';
+import { HeaderWithClose } from './button/close';
+import {
+  OptionGroup,
+  OptionGroupInputs,
+  createAccountOptionGroups,
+  isOptionGroupCheckChips,
+  socialAccountOptionGroups,
+} from '../data/option-groups';
+import { getPublicSearchFilters } from '../events/public-search-filters';
+import { OptionScreen } from './option-screen';
+import { StatusBarSpacer } from './status-bar-spacer';
+import { japi } from '../api/api';
+import { signUpRef } from '../api/sign-up-ref';
+import {
+  consumePendingWebSignIn,
+  signInWithApple,
+  signInWithDiscord,
+  useGoogleSignIn,
+} from '../api/social-auth';
+import type { SocialProvider, SocialSignInResult } from '../api/social-auth';
+import { applyAuthenticatedResponse } from '../api/auth';
+import { sessionToken } from '../kv-storage/session-token';
+import { Logo16 } from './logo';
+import { KeyboardDismissingView } from './keyboard-dismissing-view';
+import { otpDestination } from '../App';
+import { useSignedInUser } from '../events/signed-in-user';
+import { joinClub, selectSearchClub } from '../club/club';
+import { isMobile } from '../util/util';
+import { setOptionScreenPayload } from '../navigation/option-screen-store';
+import { showSignUp } from './modal/sign-up-modal';
+import { lastEvent, listen } from '../events/events';
+import { anonymousAnswers } from '../events/anonymous-answers';
+
+type StatsResponse = {
+  num_active_users: number,
+};
+
+type SessionTokenResponse = {
+  session_token: string,
+  otp_email?: string,
+};
+
+const useInModal = () =>
+  useState(() => lastEvent<boolean>('show-sign-up') ?? false)[0];
+
+const useSignUpMessage = (): string | null => {
+  const [message, setMessage] = useState<string | null>(
+    () => lastEvent<string | null>('sign-up-message') ?? null);
+
+  useEffect(() => {
+    return listen<string | null>(
+      'sign-up-message',
+      (x) => setMessage(x ?? null),
+      true,
+    );
+  }, []);
+
+  return message;
+};
+
+const activeMembersText = (
+  numActiveMembers: number,
+  minActiveMembers: number,
+  minText: string,
+) => {
+  if (numActiveMembers < minActiveMembers) {
+    return minText;
+  } else {
+    return (
+      `${numActiveMembers.toLocaleString()} active member` +
+      (numActiveMembers === 1 ? '' : 's')
+    );
+  }
+};
+
+const ActiveMembers = ({
+  numActiveMembers,
+  minActiveMembers,
+  color,
+  minText = 'on the Duolicious dating app',
+}: {
+  numActiveMembers: number,
+  minActiveMembers: number
+  color: string,
+  minText?: string,
+}) => {
+  const [opacity] = useState(() => new Animated.Value(1));
+
+  const [displayText, setDisplayText] = useState(
+    activeMembersText(numActiveMembers, minActiveMembers, minText));
+
+  const nextDisplayText =
+    activeMembersText(numActiveMembers, minActiveMembers, minText);
+
+  const isFirstRender = useRef(true);
+
+  useEffect(() => {
+    if (isFirstRender.current) {
+      isFirstRender.current = false; // Mark as not first render anymore
+      return; // Skip animation on first render
+    }
+
+    // Fade out, change text, and fade in sequence
+    Animated.sequence([
+      // Fade out
+      Animated.timing(opacity, {
+        toValue: 0,
+        duration: 250,
+        useNativeDriver: true
+      })
+    ]).start(() => {
+      setDisplayText(nextDisplayText);
+
+      // Fade in
+      Animated.timing(opacity, {
+        toValue: 1,
+        duration: 250,
+        useNativeDriver: true
+      }).start();
+    });
+  }, [nextDisplayText]);
+
+  return (
+    <Animated.Text
+      style={{
+        textAlign: 'center',
+        color,
+        opacity,
+        fontFamily: 'MontserratRegular',
+      }}
+    >
+      {displayText}
+    </Animated.Text>
+  );
+};
+
+const Stack = createNativeStackNavigator();
+
+const WelcomeScreen = () => {
+  const { width: windowWidth } = useWindowDimensions();
+  const inModal = useInModal();
+
+  // Note: the "logged-in user lands on Welcome" redirect is handled centrally
+  // by App.tsx's post-login effect (which runs on `signedInUser` changes and
+  // also covers the deep-link-then-sign-in case). Doing it here too would
+  // race with that effect.
+
+  return (
+    <View
+      style={{
+        width: '100%',
+        height: '100%',
+        backgroundColor: '#70f',
+        overflow: 'hidden',
+      }}
+    >
+      {!inModal && Platform.OS === 'web' && windowWidth >= 950 && <>
+        <img
+          src="https://duolicious.app/assets/landing/left.svg"
+          style={{
+            position: 'absolute',
+            bottom: '0',
+            left: `-${75 + Math.max(0, (1380 - windowWidth) / 2)}px`,
+            width: '500px',
+            height: 'auto',
+            objectFit: 'cover',
+            backfaceVisibility: 'hidden',
+            transition: 'transform 0.5s ease-out',
+          }}
+        >
+        </img>
+        <img
+          src="https://duolicious.app/assets/landing/right.svg"
+          style={{
+            position: 'absolute',
+            bottom: '0',
+            right: `-${75 + Math.max(0, (1380 - windowWidth) / 2)}px`,
+            width: '500px',
+            height: 'auto',
+            objectFit: 'cover',
+            backfaceVisibility: 'hidden',
+            transition: 'transform 0.5s ease-out',
+          }}
+        >
+        </img>
+      </>}
+      <View
+        style={{
+          height: '100%',
+          width: '100%',
+          maxWidth: 600,
+          alignSelf: 'center',
+          overflow: 'visible',
+        }}
+      >
+        <Stack.Navigator
+          screenOptions={{
+            headerShown: false,
+            animation: 'slide_from_right',
+          }}
+        >
+          <Stack.Screen name="Welcome Screen" component={WelcomeScreen_} />
+          <Stack.Screen
+            name="Welcome Email Screen"
+            component={EmailScreen_}
+            options={{ title: 'Sign in with email' }}
+          />
+          <Stack.Screen
+            name="Create Account Or Sign In Screen"
+            component={OptionScreen}
+            options={{ title: 'Sign in' }}
+          />
+        </Stack.Navigator>
+      </View>
+    </View>
+  );
+};
+
+const InviteScreen = ({navigation, route}: NativeStackScreenProps<RootParamList, 'Invite Screen'>) => {
+  const [loading, setLoading] = useState(false);
+  const [signedInUser] = useSignedInUser();
+
+  const clubName = route.params?.clubName as string | undefined;
+  const [numUsers, setNumUsers] = useState<number | undefined>(undefined);
+
+  if (typeof clubName !== 'string') {
+    throw new Error('clubName should be a string');
+  }
+
+  const dismiss = () => {
+    if (signedInUser) {
+      navigation.reset({ routes: [{ name: 'Home' }] });
+    } else if (Platform.OS === 'web') {
+      navigation.reset({
+        routes: [{ name: 'Home', state: { routes: [{ name: 'Search' }] } }],
+      });
+    } else {
+      navigation.reset({ routes: [{ name: 'Welcome' }] });
+    }
+  };
+
+  const submit = async () => {
+    if (signedInUser) {
+      setLoading(true);
+
+      joinClub(clubName);
+      selectSearchClub(clubName);
+
+      setLoading(false);
+
+      navigation.reset({
+        routes: [
+          {
+            name: "Home",
+            state: {
+              routes: [
+                {
+                  name: "Search"
+                }
+              ]
+            }
+          }
+        ]
+      });
+    } else {
+      navigation.reset({
+        routes: [
+          {
+            name: 'Welcome',
+            state: {
+              routes: [
+                {
+                  name: 'Welcome Screen',
+                  params: { clubName, numUsers }
+                },
+              ]
+            },
+          },
+        ],
+      });
+    }
+  };
+
+  useEffect(() => {
+    const updateNumUsers = async () => {
+      const response = await japi<StatsResponse>(
+          'GET',
+          '/stats?club-name=' + encodeURIComponent(clubName));
+
+      if (!response.ok || !response.json)
+        return;
+
+      setNumUsers(response.json.num_active_users);
+    };
+
+    if (numUsers === undefined) {
+      updateNumUsers();
+    }
+  }, [clubName, numUsers]);
+
+  return (
+    <SafeAreaView
+      style={{
+        backgroundColor: '#70f',
+        width: '100%',
+        height: '100%',
+      }}
+    >
+      <KeyboardDismissingView
+        style={{
+          width: '100%',
+          height: '100%',
+          maxWidth: 600,
+          alignSelf: 'center',
+          flexDirection: 'column',
+        }}
+      >
+        <View
+          style={{
+            marginTop: 10,
+            flexDirection: 'row',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 1,
+          }}
+        >
+          <Logo16 size={32} rectSize={0.3} />
+          <Text
+            style={{
+              color: 'white',
+              alignSelf: 'center',
+              fontFamily: 'TruenoBold',
+              fontSize: 20,
+            }}
+            selectable={false}
+          >
+            Duolicious
+          </Text>
+        </View>
+        <View
+          style={{
+            alignSelf: 'center',
+            justifyContent: 'center',
+            flex: 1,
+            width: '100%',
+            paddingHorizontal: 10,
+          }}
+        >
+          <View
+            style={{
+              backgroundColor: 'white',
+              borderRadius: 10,
+              shadowOffset: {
+                width: 0,
+                height: 2,
+              },
+              shadowOpacity: 0.5,
+              shadowRadius: 10,
+              elevation: 3,
+              paddingTop: 10,
+              width: '100%',
+              overflow: 'hidden',
+            }}
+          >
+            <View
+              style={{
+                alignSelf: 'center',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: 10,
+                width: '100%',
+                paddingHorizontal: 10,
+              }}
+            >
+              <HeaderWithClose onPress={dismiss} color="black">
+                <DefaultText
+                  style={{
+                    marginTop: 10,
+                    textAlign: 'center',
+                    color: '#555',
+                  }}
+                >
+                  You’re invited to join
+                </DefaultText>
+              </HeaderWithClose>
+              <DefaultText
+                style={{
+                  textAlign: 'center',
+                  color: 'black',
+                  fontSize: 26,
+                  fontWeight: 900,
+                  flexShrink: 1,
+                  width: '100%',
+                }}
+              >
+                {clubName}
+              </DefaultText>
+              <ActiveMembers
+                numActiveMembers={numUsers ?? -1}
+                minActiveMembers={10}
+                color="#555"
+              />
+            </View>
+            <View
+              style={{
+                justifyContent: 'center',
+                padding: 20,
+                paddingTop: 40,
+                alignSelf: 'flex-start',
+                width: '100%',
+              }}
+            >
+              <ButtonWithCenteredText
+                onPress={submit}
+                borderWidth={0}
+                loading={loading}
+              >
+                <DefaultText disableTheme style={{fontWeight: '700'}}>
+                  Accept Invite
+                </DefaultText>
+              </ButtonWithCenteredText>
+              <DefaultText
+                style={{
+                  color: '#777',
+                  textAlign: 'center',
+                  alignSelf: 'center',
+                  lineHeight: 28,
+                }}
+              >
+                By joining you agree to our {}
+                <LinkText
+                  disableTheme
+                  style={{
+                    fontWeight: '600',
+                  }}
+                  href="https://duolicious.app/terms"
+                >
+                  Terms
+                </LinkText>
+                {}, {}
+                <LinkText
+                  disableTheme
+                  style={{ fontWeight: '600' }}
+                  href="https://duolicious.app/privacy"
+                >
+                  Privacy Policy
+                </LinkText>
+                {} and {}
+                <LinkText
+                  disableTheme
+                  style={{ fontWeight: '600' }}
+                  href="https://duolicious.app/guidelines"
+                >
+                  Community Guidelines
+                </LinkText>
+              </DefaultText>
+            </View>
+          </View>
+        </View>
+      </KeyboardDismissingView>
+    </SafeAreaView>
+  );
+};
+
+const discordIconPath = 'M20.317 4.3698a19.7913 19.7913 0 00-4.8851-1.5152.0741.0741 0 00-.0785.0371c-.211.3753-.4447.8648-.6083 1.2495-1.8447-.2762-3.68-.2762-5.4868 0-.1636-.3933-.4058-.8742-.6177-1.2495a.077.077 0 00-.0785-.037 19.7363 19.7363 0 00-4.8852 1.515.0699.0699 0 00-.0321.0277C.5334 9.0458-.319 13.5799.0992 18.0578a.0824.0824 0 00.0312.0561c2.0528 1.5076 4.0413 2.4228 5.9929 3.0294a.0777.0777 0 00.0842-.0276c.4616-.6304.8731-1.2952 1.226-1.9942a.076.076 0 00-.0416-.1057c-.6528-.2476-1.2743-.5495-1.8722-.8923a.077.077 0 01-.0076-.1277c.1258-.0943.2517-.1923.3718-.2914a.0743.0743 0 01.0776-.0105c3.9278 1.7933 8.18 1.7933 12.0614 0a.0739.0739 0 01.0785.0095c.1202.099.246.1981.3728.2924a.077.077 0 01-.0066.1276 12.2986 12.2986 0 01-1.873.8914.0766.0766 0 00-.0407.1067c.3604.698.7719 1.3628 1.225 1.9932a.076.076 0 00.0842.0286c1.961-.6067 3.9495-1.5219 6.0023-3.0294a.077.077 0 00.0313-.0552c.5004-5.177-.8382-9.6739-3.5485-13.6604a.061.061 0 00-.0312-.0286zM8.02 15.3312c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9555-2.4189 2.157-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.9555 2.4189-2.1569 2.4189zm7.9748 0c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9554-2.4189 2.1569-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.946 2.4189-2.1568 2.4189Z';
+
+// Text size / weight mirrors the bottom "Sign Up or Sign In" CTA
+// (`fontSize: 16, fontWeight: '700'`) so all primary buttons in the
+// onboarding flow look identical.
+const PrimaryAuthButton = ({
+  onPress,
+  loading,
+  icon,
+  backgroundColor,
+  textColor,
+  children,
+}: {
+  onPress: () => void,
+  loading: boolean,
+  icon: React.ReactNode,
+  backgroundColor: string,
+  textColor: string,
+  children: React.ReactNode,
+}) => (
+  <ButtonWithCenteredText
+    onPress={onPress}
+    loading={loading}
+    backgroundColor={backgroundColor}
+    textColor={textColor}
+    borderColor="#000"
+    borderWidth={1}
+    containerStyle={{ marginTop: 0, marginBottom: 10 }}
+    fontSize={16}
+    textStyle={{ fontWeight: '700' }}
+    icon={icon}
+  >
+    {children}
+  </ButtonWithCenteredText>
+);
+
+const TermsBlurb = () => (
+  <DefaultText
+    style={{
+      color: 'white',
+      textAlign: 'center',
+      alignSelf: 'center',
+      lineHeight: 28,
+    }}
+  >
+    By signing up you agree to our {}
+    <LinkText
+      disableTheme
+      style={{ fontWeight: '600' }}
+      href="https://duolicious.app/terms"
+    >
+      Terms
+    </LinkText>
+    {}, {}
+    <LinkText
+      disableTheme
+      style={{ fontWeight: '600' }}
+      href="https://duolicious.app/privacy"
+    >
+      Privacy Policy
+    </LinkText>
+    {} and {}
+    <LinkText
+      disableTheme
+      style={{ fontWeight: '600' }}
+      href="https://duolicious.app/guidelines"
+    >
+      Community Guidelines
+    </LinkText>
+  </DefaultText>
+);
+
+const LogoHeader = () => (
+  <View
+    style={{
+      marginTop: 10,
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 1,
+    }}
+  >
+    <Logo16 size={32} rectSize={0.3} doAnimate={true} />
+    <Text
+      style={{
+        color: 'white',
+        alignSelf: 'center',
+        fontFamily: 'TruenoBold',
+        fontSize: 20,
+      }}
+      selectable={false}
+    >
+      Duolicious
+    </Text>
+  </View>
+);
+
+const Hero = ({
+  clubName,
+  numUsers,
+  showTagline,
+  showActiveMembers,
+}: {
+  clubName?: string,
+  numUsers?: number,
+  showTagline: boolean,
+  showActiveMembers: boolean,
+}) => (
+  <View
+    style={{
+      alignSelf: 'center',
+      alignItems: 'center',
+      gap: 10,
+      paddingTop: 20,
+      paddingBottom: 10,
+    }}
+  >
+    {showTagline &&
+      <DefaultText
+        style={{
+          maxWidth: 320,
+          textAlign: 'center',
+          color: 'white',
+          fontSize: 30,
+          fontWeight: 900,
+        }}
+      >
+        {clubName ?
+          `Join ${clubName} on Duolicious` :
+          'Cute dates & dank memes await...'}
+      </DefaultText>
+    }
+    {showActiveMembers &&
+      <ActiveMembers
+        numActiveMembers={numUsers ?? -1}
+        minActiveMembers={0}
+        color="white"
+        minText={'\xa0'}
+      />
+    }
+  </View>
+);
+
+const withPublicSearchGender = (
+  optionGroups: OptionGroup<OptionGroupInputs>[],
+): OptionGroup<OptionGroupInputs>[] => {
+  const { gender } = getPublicSearchFilters();
+
+  return optionGroups.map((og) => {
+    const { input } = og;
+
+    if (!gender || !isOptionGroupCheckChips(input)) {
+      return og;
+    }
+
+    return {
+      ...og,
+      input: {
+        checkChips: {
+          ...input.checkChips,
+          values: input.checkChips.values.map((v) =>
+            ({ ...v, checked: gender.includes(v.label) })),
+        },
+      },
+    };
+  });
+};
+
+// Shared by the welcome and email screens to keep `num_active_users`
+// fresh on mount when not already prefilled by an invite deep-link.
+const useNumActiveUsers = (initial: number | undefined) => {
+  const [numUsers, setNumUsers] = useState<number | undefined>(initial);
+  useEffect(() => {
+    if (numUsers !== undefined) return;
+    (async () => {
+      const response = await japi<StatsResponse>('GET', '/stats');
+      if (response.ok && response.json) setNumUsers(response.json.num_active_users);
+    })();
+  }, [numUsers]);
+  return numUsers;
+};
+
+const WelcomeScreen_ = ({navigation, route}: NativeStackScreenProps<WelcomeParamList, 'Welcome Screen'>) => {
+  const clubName_ = (route.params?.clubName) as string | undefined;
+  const numUsers = useNumActiveUsers(route.params?.numUsers);
+  const inModal = useInModal();
+  const signUpMessage = useSignUpMessage();
+
+  const [loginStatus, setLoginStatus] = useState("");
+  const [socialLoading, setSocialLoading] = useState<SocialProvider | null>(null);
+
+  const googleSignIn = useGoogleSignIn();
+  const { height: windowHeight } = useWindowDimensions();
+
+  const onPressUseEmail = () => {
+    // Pass `clubName` along only when it's set, so an ordinary visitor
+    // gets a clean `/email` URL with no query string. `numUsers` is
+    // display-only and irrelevant on the email page — omitting it
+    // keeps it out of the URL bar.
+    navigation.navigate(
+      'Welcome Email Screen',
+      clubName_ ? { clubName: clubName_ } : undefined,
+    );
+  };
+
+  const context: { clubName?: string, ref?: string } = {
+    clubName: clubName_,
+    ref: signUpRef,
+  };
+
+  const signInWith = async (
+    provider: SocialProvider,
+    signIn: () => Promise<SocialSignInResult>,
+    { clubName, ref } = context,
+  ) => {
+    if (socialLoading) return;
+    setLoginStatus("");
+    setSocialLoading(provider);
+    try {
+      const result = await signIn();
+      if (!result.ok && !result.cancelled) {
+        setLoginStatus(result.reason ?? 'Sign-in failed');
+        return;
+      }
+      if (!result.ok) return;
+
+      const response = await japi<SessionTokenResponse>(
+        'post',
+        `/sign-in-with-${provider}`,
+        {
+          ...result.body,
+          ...(clubName && { pending_club_name: clubName }),
+          ref,
+        },
+        { timeout: 9999 * 1000, maxRetries: 0 },
+      );
+
+      if (!response.ok) {
+        const serverMessage =
+          typeof response.text === 'string' ? response.text.trim() : '';
+        setLoginStatus(
+          response.status === 409 && serverMessage ? serverMessage :
+          response.status === 401 ? 'Sign-in token couldn’t be verified' :
+          response.status === 429 ? 'You’re doing that too much' :
+          response.status === 460 ? 'Turn off your VPN and try again' :
+          response.status === 461 ? 'Your account is banned' :
+          'We couldn’t connect to Duolicious'
+        );
+        return;
+      }
+
+      const newSessionToken: string | undefined = response.json?.session_token;
+      if (typeof newSessionToken !== 'string') {
+        setLoginStatus('Server didn’t return a session token');
+        return;
+      }
+      await sessionToken(newSessionToken);
+
+      const otpEmail = response.json?.otp_email;
+      if (otpEmail) {
+        otpDestination.value = otpEmail;
+        await japi('post', '/resend-otp');
+      }
+
+      if (
+        otpEmail ||
+        await applyAuthenticatedResponse(response, newSessionToken)
+          === 'needs-onboarding'
+      ) {
+        setOptionScreenPayload('Create Account Or Sign In Screen', {
+          optionGroups: withPublicSearchGender(otpEmail
+            ? createAccountOptionGroups
+            : socialAccountOptionGroups),
+          showSkipButton: false,
+          showCloseButton: false,
+          showBackButton: true,
+          backgroundColor: '#7700ff',
+          color: '#ffffff',
+        });
+        navigation.navigate('Create Account Or Sign In Screen');
+      }
+    } finally {
+      setSocialLoading(null);
+    }
+  };
+
+  useEffect(() => {
+    const pending = consumePendingWebSignIn();
+    if (!pending) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    signInWith(pending.provider, async () => pending.result, pending.context);
+  }, []);
+
+  return (
+    <SafeAreaView
+      style={{
+        backgroundColor: '#70f',
+        width: '100%',
+        height: '100%',
+        flexDirection: 'row',
+        justifyContent: 'center',
+        overflow: 'hidden',
+      }}
+    >
+      <KeyboardDismissingView
+        style={{
+          width: '100%',
+          height: '100%',
+          alignSelf: 'center',
+          flexDirection: 'column',
+        }}
+      >
+        {inModal &&
+          <IconButton
+            label="Close"
+            onPress={() => showSignUp(false)}
+            padding={10}
+            style={{ position: 'absolute', top: 1, right: 0, zIndex: 99 }}
+          >
+            <Ionicons
+              style={{ fontSize: 30, lineHeight: 30, color: 'white' }}
+              name="close"
+            />
+          </IconButton>
+        }
+        <LogoHeader />
+        {!inModal &&
+          <Hero
+            clubName={clubName_}
+            numUsers={numUsers}
+            showTagline={windowHeight > 460}
+            showActiveMembers={windowHeight > 500}
+          />
+        }
+        <View
+          style={{
+            flex: 1,
+            justifyContent: 'center',
+            paddingHorizontal: 20,
+            width: '100%',
+            alignSelf: 'center',
+          }}
+        >
+          <DefaultText
+            style={{
+              color: 'white',
+              textAlign: 'center',
+              marginBottom: inModal ? 40 : 20,
+              fontSize: inModal ? 36 : 20,
+              fontWeight: inModal ? 900 : 700,
+            }}
+          >
+            {inModal && signUpMessage ? signUpMessage : 'Join or sign in'}
+          </DefaultText>
+          <PrimaryAuthButton
+            onPress={onPressUseEmail}
+            loading={false}
+            icon={<Ionicons name="mail-outline" size={22} color="#000000" />}
+            backgroundColor="#ffffff"
+            textColor="#000000"
+          >
+            Use email
+          </PrimaryAuthButton>
+          <PrimaryAuthButton
+            onPress={() => googleSignIn.ready &&
+              signInWith('google', googleSignIn.promptForIdToken)}
+            loading={socialLoading === 'google'}
+            icon={<Ionicons name="logo-google" size={22} color="#ffffff" />}
+            backgroundColor="#000000"
+            textColor="#ffffff"
+          >
+            Continue with Google
+          </PrimaryAuthButton>
+          <PrimaryAuthButton
+            onPress={() => signInWith('apple', () => signInWithApple(context))}
+            loading={socialLoading === 'apple'}
+            icon={<Ionicons name="logo-apple" size={22} color="#ffffff" />}
+            backgroundColor="#000000"
+            textColor="#ffffff"
+          >
+            Continue with Apple
+          </PrimaryAuthButton>
+          <PrimaryAuthButton
+            onPress={() => signInWith('discord', () => signInWithDiscord(context))}
+            loading={socialLoading === 'discord'}
+            icon={
+              <Svg width={22} height={22} viewBox="0 0 24 24">
+                <Path fill="#ffffff" d={discordIconPath} />
+              </Svg>
+            }
+            backgroundColor="#000000"
+            textColor="#ffffff"
+          >
+            Continue with Discord
+          </PrimaryAuthButton>
+          <DefaultText
+            style={{
+              alignSelf: 'center',
+              marginTop: 5,
+              color: 'white',
+              opacity: loginStatus !== "" ? 1 : 0,
+            }}
+          >
+            {loginStatus || '\xa0'}
+          </DefaultText>
+        </View>
+        <View
+          style={{
+            justifyContent: 'center',
+            paddingHorizontal: 20,
+            paddingBottom: 10,
+            alignSelf: 'flex-start',
+            width: '100%',
+          }}
+        >
+          <TermsBlurb />
+        </View>
+      </KeyboardDismissingView>
+    </SafeAreaView>
+  );
+};
+
+const EmailScreen_ = ({navigation, route}: NativeStackScreenProps<WelcomeParamList, 'Welcome Email Screen'>) => {
+  const clubName_ = (route.params?.clubName) as string | undefined;
+
+  const [email, setEmail] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const [loginStatus, setLoginStatus] = useState("");
+
+  const { height: windowHeight } = useWindowDimensions();
+
+  const setEmailSafely = (e: string) => {
+    setEmail(e.replace(/\s/g, ''));
+  };
+
+  const submit = async (suffix?: string) => {
+    const suffix_ = suffix ?? '';
+    const email_ = email + (email.endsWith(suffix_) ? '' : suffix_);
+
+    setLoginStatus("");
+    setIsLoading(true);
+    setEmailSafely(email_);
+    otpDestination.value = email_;
+
+    Keyboard.dismiss();
+
+    const response = await japi<SessionTokenResponse>(
+      'post',
+      '/request-otp',
+      {
+        email: email_,
+        ...(clubName_ && { pending_club_name: clubName_ }),
+        ...(anonymousAnswers.length && { answers: anonymousAnswers }),
+        ref: signUpRef,
+      },
+      { timeout: 9999 * 1000 },
+    );
+
+    setIsLoading(false);
+
+    if (response.ok && response.json) {
+      await sessionToken(response.json.session_token);
+
+      setOptionScreenPayload('Create Account Or Sign In Screen', {
+        optionGroups: withPublicSearchGender(createAccountOptionGroups),
+        showSkipButton: false,
+        showCloseButton: false,
+        showBackButton: true,
+        backgroundColor: '#7700ff',
+        color: '#ffffff',
+      });
+      navigation.navigate('Create Account Or Sign In Screen');
+    } else {
+      setLoginStatus(
+        response.status === 400 ? 'We don’t support that email provider' :
+        response.status === 429 ? 'You’re doing that too much' :
+        response.status === 460 ? 'Turn off your VPN and try again' :
+        response.status === 461 ? 'Your account is banned' :
+        'We couldn’t connect to Duolicious'
+      );
+    }
+  };
+
+  // Layout deliberately mirrors `OptionScreen` — back button + bold
+  // title + description on top, focused input in the middle, single
+  // `Continue` button at the bottom — so this page looks like the OTP
+  // step and onboarding wizard that follow it.
+  return (
+    <SafeAreaView
+      edges={['bottom', 'left', 'right']}
+      style={{
+        backgroundColor: '#7700ff',
+        width: '100%',
+        height: '100%',
+      }}
+    >
+      <KeyboardDismissingView
+        style={{
+          height: '100%',
+          width: '100%',
+          maxWidth: 600,
+          alignSelf: 'center',
+        }}
+      >
+        <StatusBarSpacer/>
+        <View
+          style={{
+            alignItems: 'center',
+            paddingTop: 10,
+            paddingBottom: 20,
+          }}
+        >
+          <IconButton
+            label="Back"
+            onPress={() => navigation.goBack()}
+            padding={15}
+            style={{ position: 'absolute', top: 0, left: 0, zIndex: 99 }}
+          >
+            <FontAwesomeIcon
+              icon={faArrowLeft}
+              size={24}
+              color="white"
+            />
+          </IconButton>
+          <DefaultText
+            disableTheme
+            style={{
+              textAlign: 'center',
+              fontWeight: '700',
+              fontSize: 28,
+              color: 'white',
+              paddingLeft: 40,
+              paddingRight: 40,
+            }}
+          >
+            Continue with email
+          </DefaultText>
+          <DefaultText
+            disableTheme
+            style={{
+              ...descriptionStyle.style,
+              color: 'white',
+            }}
+          >
+            Enter your email address to join or sign in. We’ll send you a
+            one-time password to confirm it.
+          </DefaultText>
+        </View>
+        <View
+          style={{
+            flex: 1,
+            justifyContent: 'center',
+            paddingHorizontal: 20,
+          }}
+        >
+          <DefaultTextInput
+            placeholder="you@example.com"
+            keyboardType="email-address"
+            textContentType="emailAddress"
+            autoComplete="email"
+            autoCapitalize="none"
+            inputMode="email"
+            value={email}
+            onChangeText={setEmailSafely}
+            onSubmitEditing={isMobile() ? undefined : () => submit()}
+            autoFocus={Platform.OS !== 'ios'}
+          />
+          <DefaultText
+            style={{
+              alignSelf: 'center',
+              marginTop: 5,
+              color: 'white',
+              opacity: loginStatus !== "" ? 1 : 0,
+            }}
+          >
+            {loginStatus || '\xa0'}
+          </DefaultText>
+          {windowHeight > 500 &&
+            <View
+              style={{
+                flexDirection: 'row',
+                flexWrap: 'wrap',
+                justifyContent: 'center',
+                marginTop: 5,
+                gap: 10,
+              }}
+            >
+              {[
+                '@gmail.com',
+                '@proton.me',
+                '@yahoo.com',
+                '@hotmail.com',
+                '@outlook.com',
+              ].map((suffix) =>
+                <ButtonWithCenteredText
+                  key={suffix}
+                  onPress={() => !isLoading && submit(suffix)}
+                  borderWidth={0}
+                  secondary={true}
+                  containerStyle={{
+                    marginTop: 0,
+                    marginBottom: 0,
+                    height: undefined,
+                  }}
+                  backgroundColor="rgb(228, 204, 255)"
+                  textStyle={{
+                    padding: 10,
+                    fontSize: 12,
+                    color: '#70f',
+                  }}
+                >
+                  {suffix}
+                </ButtonWithCenteredText>
+              )}
+            </View>
+          }
+        </View>
+        <View
+          style={{
+            flexShrink: 1,
+            justifyContent: 'flex-end',
+            alignItems: 'center',
+            padding: 10,
+            paddingBottom: 20,
+          }}
+        >
+          <ButtonWithCenteredText
+            secondary
+            onPress={() => submit()}
+            loading={isLoading}
+            containerStyle={{ width: '90%' }}
+          >
+            Continue
+          </ButtonWithCenteredText>
+        </View>
+      </KeyboardDismissingView>
+    </SafeAreaView>
+  );
+};
+
+export {
+  InviteScreen,
+  WelcomeScreen,
+  useNumActiveUsers,
+};

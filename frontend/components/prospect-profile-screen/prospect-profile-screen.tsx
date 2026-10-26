@@ -1,0 +1,1862 @@
+import {
+  Platform,
+  ScrollView,
+  StyleProp,
+  StyleSheet,
+  TextStyle,
+  View,
+  ViewStyle,
+} from 'react-native';
+import { Pressable } from '../pressable';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import {
+  Fragment,
+  ReactNode,
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+import {
+  NativeStackNavigationProp,
+  NativeStackScreenProps,
+  createNativeStackNavigator,
+} from '@react-navigation/native-stack';
+import {
+  CompositeNavigationProp,
+  CompositeScreenProps,
+  useNavigation,
+} from '@react-navigation/native';
+import type { ProspectParamList, RootParamList } from '../../navigation/linking';
+import { LogoActivityIndicator } from '../logo/logo-activity-indicator';
+import { DefaultText } from '../default-text';
+import { DonutChart } from '../donut-chart';
+import { Title } from '../title';
+import {
+  lookingForDescription,
+  lookingForEmoji,
+} from './looking-for';
+import { InDepthScreen } from '../in-depth-screen';
+import { ButtonWithCenteredText } from '../button/centered-text';
+import { api } from '../../api/api';
+import { cmToFeetInchesStr } from '../../units/units';
+import { useSignedInUser } from '../../events/signed-in-user';
+import { navigateToConversation } from '../../navigation/use-navigation-to-conversation';
+import { postSkipped } from '../../hide-and-block/hide-and-block';
+import { Basic, Basics } from '../basic';
+import { themedSurface, legibleSurface } from '../../app-theme/surface';
+import { Club, Clubs } from '../club';
+import { Stat, Stats } from '../stat';
+import { notify } from '../../events/events';
+import { useBackButtonClaim } from '../../events/back-button';
+import { COLUMN_MAX_WIDTH } from '../../constants/constants';
+import { ReportModalInitialData } from '../modal/report-modal';
+import { getProspectHint, setProspectHint } from '../../navigation/prospect-cache';
+import { setBannerProspectName } from '../../events/banner-prospect-name';
+import {
+  VerificationBadge,
+  DetailedVerificationBadges,
+} from '../verification-badge';
+import Ionicons from '@expo/vector-icons/Ionicons';
+import { FontAwesomeIcon } from '@fortawesome/react-native-fontawesome'
+import { faRulerVertical } from '@fortawesome/free-solid-svg-icons/faRulerVertical'
+import { faHandsPraying } from '@fortawesome/free-solid-svg-icons/faHandsPraying'
+import { faPills } from '@fortawesome/free-solid-svg-icons/faPills'
+import { faSmoking } from '@fortawesome/free-solid-svg-icons/faSmoking'
+import { faPaperPlane } from '@fortawesome/free-solid-svg-icons/faPaperPlane'
+import { faReply } from '@fortawesome/free-solid-svg-icons/faReply'
+import { faLocationDot } from '@fortawesome/free-solid-svg-icons/faLocationDot'
+import { faUser } from '@fortawesome/free-solid-svg-icons/faUser'
+import { RotateCcw, Flag, X, Share2 } from "react-native-feather";
+import Reanimated, {
+  Easing,
+  FadeOut,
+  LinearTransition,
+  useAnimatedStyle,
+  useSharedValue,
+  withTiming,
+} from 'react-native-reanimated';
+import { pressClub, useJoinedClubs } from '../../club/club';
+import type { SpotifyArtistItem } from '../../api/spotify';
+import { SpotifyArtists, SpotifyTitle } from '../spotify-artists';
+import * as _ from 'lodash';
+import {
+  friendlyTimeAgo,
+  possessive,
+  bestTextOn,
+  capLuminance,
+  isUuid,
+  isMobile,
+  viewportPosition,
+} from '../../util/util';
+import { useTimeSinceLabel } from '../../util/clock';
+import { useOnline } from '../../chat/application-layer/hooks/online';
+import { HeartBackground } from '../heart-background';
+import { AudioPlayer } from '../audio-player';
+import { EnlargeablePhoto } from '../enlargeable-image';
+import type { PhotoGeometry } from '../../util/photos';
+import type { AlbumPhoto } from '../../events/expanded-photo';
+import { commonStyles } from '../../styles';
+import { useSkipped, setSkipped } from '../../hide-and-block/hide-and-block';
+import { OnlineIndicator } from '../online-indicator';
+import { Flair } from '../badges';
+import { useAppTheme } from '../../app-theme/app-theme';
+import { faChild } from '@fortawesome/free-solid-svg-icons/faChild'
+import { faChildren } from '@fortawesome/free-solid-svg-icons/faChildren'
+import { AboutText } from './about-reply';
+import { useQuote } from '../conversation-screen/quote';
+import { copyProfileLink } from '../../util/util';
+import { SimilarProfiles } from './similar-profiles';
+import {
+  SidePanelCard,
+  SidePanelLayout,
+  useFitsSidePanels,
+} from '../navigation/side-panel';
+import { encodedAnonymousAnswers } from '../../events/anonymous-answers';
+import { storeKv } from '../../kv-storage/kv-storage';
+import type { PageItem } from '../search-tab';
+import {
+  AnimatedPressable,
+  hoverColorFor,
+  hoverTransition,
+  RiseEdge,
+  riseStyle,
+  useHover,
+  usePressed,
+} from '../hover';
+
+// The person's photos in order, so tapping any one lets the gallery page
+// through the rest.
+const buildAlbum = (
+  uuids: string[] | undefined,
+  extraExts: string[][] | undefined,
+  geometries: (PhotoGeometry | null)[] | undefined,
+  blurhashes: string[] | undefined,
+): AlbumPhoto[] =>
+  (uuids ?? []).map((uuid, i) => ({
+    uuid,
+    extraExts: extraExts?.[i] ?? [],
+    geometry: geometries?.[i] ?? null,
+    blurhash: blurhashes?.[i] ?? null,
+  }));
+
+const primaryPhotoBigScreenRadii = { bottomLeft: 12, bottomRight: 12 };
+
+
+type ProspectScreenNavigation = CompositeNavigationProp<
+  NativeStackNavigationProp<ProspectParamList>,
+  NativeStackNavigationProp<RootParamList>
+>;
+type ProspectScreenProps = CompositeScreenProps<
+  NativeStackScreenProps<ProspectParamList, 'Prospect Profile'>,
+  NativeStackScreenProps<RootParamList>
+>;
+
+const Stack = createNativeStackNavigator();
+
+const ProspectProfileScreen = () => {
+  return (
+    <Stack.Navigator
+      screenOptions={{
+        headerShown: false,
+        presentation: 'card',
+        animation: 'slide_from_right',
+      }}
+    >
+      <Stack.Screen name="Prospect Profile" component={Content} />
+      <Stack.Screen name="In-Depth" component={InDepthScreen} />
+    </Stack.Navigator>
+  );
+};
+
+const profilePillButtonStyle = (
+  surface: ReturnType<typeof legibleSurface>,
+  pressed: boolean,
+  hovered: boolean,
+): ViewStyle => ({
+  marginTop: 100,
+  alignSelf: 'center',
+  flexDirection: 'row',
+  alignItems: 'center',
+  gap: 7,
+  paddingVertical: 8,
+  paddingHorizontal: 14,
+  borderWidth: 1,
+  borderBottomWidth: 3,
+  borderRadius: 999,
+  backgroundColor: surface.backgroundColor,
+  borderColor: surface.borderColor,
+  opacity: pressed ? 0.6 : 1,
+  ...riseStyle(hovered && !pressed),
+});
+
+const PillRiseEdge = ({ surface, hovered, pressed }: {
+  surface: ReturnType<typeof legibleSurface>
+  hovered: boolean
+  pressed: boolean
+}) => (
+  <RiseEdge
+    raised={hovered && !pressed}
+    pressed={pressed}
+    color={surface.borderColor}
+    border={{ top: 1, right: 1, bottom: 3, left: 1 }}
+  />
+);
+
+const profilePillButtonTextStyle = (
+  surface: ReturnType<typeof legibleSurface>,
+): TextStyle => ({
+  overflow: 'hidden',
+  textAlign: 'center',
+  color: surface.color,
+});
+
+const ShareButton = ({personUuid, backgroundColor}: {
+  personUuid: string | undefined,
+  backgroundColor: string,
+}) => {
+  const onPress = useCallback(() => {
+    copyProfileLink(personUuid);
+  }, [personUuid]);
+
+  const surface = legibleSurface(backgroundColor);
+  const { hovered, hoverProps } = useHover();
+  const { pressed, pressProps } = usePressed();
+
+  return (
+    <AnimatedPressable
+      onPress={onPress}
+      accessibilityLabel="Copy profile link"
+      style={[
+        profilePillButtonStyle(surface, pressed, hovered),
+        hoverTransition(pressed ? 'none' : 'top'),
+        { marginBottom: 0 },
+      ]}
+      {...hoverProps}
+      {...pressProps}
+    >
+      <PillRiseEdge surface={surface} hovered={hovered} pressed={pressed} />
+      <Share2
+        stroke={surface.color}
+        strokeWidth={2}
+        height={18}
+        width={18}
+      />
+      <DefaultText style={profilePillButtonTextStyle(surface)}>
+        Share profile
+      </DefaultText>
+    </AnimatedPressable>
+  );
+};
+
+const FloatingProfileInteractionButton = ({
+  children,
+  onPress,
+  backgroundColor,
+}: {
+  children: ReactNode,
+  onPress: () => void,
+  backgroundColor: string,
+}) => {
+  const { appTheme } = useAppTheme();
+
+  const ref = useRef<View>(null);
+
+  // On web, pressing a non-editable element collapses the current text
+  // selection (its default `mousedown` behavior). That wipes the quote derived
+  // from the selected profile text before `onPress` can navigate. Prevent the
+  // default so the selection survives the press.
+  useEffect(() => {
+    if (Platform.OS !== 'web') return;
+    const node = ref.current as unknown as HTMLElement | null;
+    if (!node) return;
+    const onMouseDown = (e: MouseEvent) => e.preventDefault();
+    node.addEventListener('mousedown', onMouseDown);
+    return () => node.removeEventListener('mousedown', onMouseDown);
+  }, []);
+
+  const opacity = useSharedValue(1);
+  const opacityStyle = useAnimatedStyle(() => ({ opacity: opacity.value }));
+  const { hovered, hoverProps } = useHover();
+
+  const fadeOut = useCallback(() => {
+    opacity.set(0.4);
+  }, []);
+
+  const fadeIn = useCallback(() => {
+    opacity.set(withTiming(1, { duration: 50 }));
+  }, []);
+
+  return (
+    <Pressable
+      ref={ref}
+      style={{
+        borderRadius: 999,
+        zIndex: 999,
+        marginLeft: 20,
+        marginRight: 20,
+        marginBottom: 14,
+        marginTop: 14,
+      }}
+      onPressIn={fadeOut}
+      onPressOut={fadeIn}
+      onPress={onPress}
+      {...hoverProps}
+    >
+      <Reanimated.View
+        style={[{
+          borderRadius: 999,
+          alignItems: 'center',
+          justifyContent: 'center',
+          backgroundColor: hovered
+            ? hoverColorFor(backgroundColor, appTheme)
+            : backgroundColor,
+          transform: [{ scale: hovered ? 1.06 : 1 }],
+          flexDirection: 'row',
+          borderWidth: 1,
+          borderColor: appTheme.secondaryColor,
+          height: 60,
+          width: 60,
+        }, hoverTransition(['backgroundColor', 'transform']), opacityStyle]}
+      >
+        {children}
+      </Reanimated.View>
+    </Pressable>
+  );
+};
+
+const FloatingSkipButton = ({personUuid}: {
+  personUuid: string | null | undefined,
+}) => {
+  const { isSkipped, isLoading, isPosting } = useSkipped(personUuid);
+  const { appTheme } = useAppTheme();
+
+  const onPress = useCallback(async () => {
+    if (personUuid == null) return;
+    if (isLoading) return;
+
+    const nextIsSkippedState = !isSkipped;
+
+    await postSkipped(personUuid, nextIsSkippedState);
+  }, [isLoading, isSkipped, personUuid]);
+
+  return (
+    <FloatingProfileInteractionButton
+      onPress={onPress}
+      backgroundColor={appTheme.primaryColor}
+    >
+      {isPosting &&
+        <LogoActivityIndicator size="medium" color={appTheme.brandColor} />
+      }
+      {!isLoading && isSkipped === true && <RotateCcw
+          stroke={appTheme.brandColor}
+          strokeWidth={3}
+          height={24}
+          width={24}
+        />
+      }
+      {!isLoading && isSkipped === false && <X
+          stroke={appTheme.brandColor}
+          strokeWidth={3}
+          height={24}
+          width={24}
+        />
+      }
+    </FloatingProfileInteractionButton>
+  );
+};
+
+const FloatingSendIntroButton = ({
+  personUuid,
+  urlSlug,
+  name,
+  photoUuid,
+  photoBlurhash,
+}: {
+  personUuid: string | null | undefined,
+  urlSlug: string | undefined,
+  name: string | undefined,
+  photoUuid: string | null | undefined,
+  photoBlurhash: string | null | undefined,
+}) => {
+  const { appTheme } = useAppTheme();
+  const navigation = useNavigation<NativeStackNavigationProp<RootParamList>>();
+
+  const quote = useQuote();
+
+  const onPress = useCallback(() => {
+    if (personUuid == null) return;
+    if (name === undefined) return;
+
+    navigateToConversation(
+      navigation,
+      { personUuid, urlSlug: urlSlug ?? null, name, photoUuid, photoBlurhash },
+    );
+  }, [navigation, personUuid, urlSlug, name, photoUuid, photoBlurhash]);
+
+  return (
+    <FloatingProfileInteractionButton
+      onPress={onPress}
+      backgroundColor={appTheme.brandColor}
+    >
+      {personUuid !== undefined && name !== undefined &&
+        <FontAwesomeIcon
+          icon={quote ? faReply : faPaperPlane}
+          size={24}
+          style={{
+            color: appTheme.primaryColor,
+          }}
+        />
+      }
+    </FloatingProfileInteractionButton>
+  );
+};
+
+const AnonymousSignInCta = ({navigation, name}: {
+  navigation: ProspectScreenNavigation,
+  name: string | undefined,
+}) => {
+  const { appTheme } = useAppTheme();
+  const insets = useSafeAreaInsets();
+
+  // Push Welcome (don't `reset`) so the system back button still points at
+  // the profile and the user can bail out of sign-in.
+  const onPress = useCallback(() => {
+    navigation.navigate('Welcome');
+  }, [navigation]);
+
+  return (
+    <View
+      style={{
+        position: viewportPosition(),
+        bottom: insets.bottom,
+        width: '100%',
+        maxWidth: COLUMN_MAX_WIDTH,
+        alignSelf: 'center',
+        zIndex: 999,
+        paddingLeft: 20,
+        paddingRight: 20,
+        paddingBottom: 14,
+        paddingTop: 14,
+      }}
+      pointerEvents="box-none"
+    >
+      <Pressable
+        onPress={onPress}
+        style={{
+          backgroundColor: appTheme.brandColor,
+          borderRadius: 999,
+          paddingVertical: 16,
+          paddingHorizontal: 20,
+          alignItems: 'center',
+          justifyContent: 'center',
+          flexDirection: 'row',
+          gap: 10,
+          borderWidth: 1,
+          borderColor: appTheme.secondaryColor,
+        }}
+      >
+        <FontAwesomeIcon
+          icon={faPaperPlane}
+          size={18}
+          style={{ color: appTheme.primaryColor }}
+        />
+        <DefaultText
+          style={{
+            color: appTheme.primaryColor,
+            fontWeight: '700',
+            fontSize: 16,
+            textAlign: 'center',
+          }}
+        >
+          {name === undefined
+            ? 'Sign up to send a message'
+            : `Sign up to message ${name}`}
+        </DefaultText>
+      </Pressable>
+    </View>
+  );
+};
+
+const seeQAndAButtonChevron =
+  <View
+    style={{
+      position: 'absolute',
+      top: 0,
+      right: 15,
+      height: '100%',
+      justifyContent: 'center',
+    }}
+  >
+    <Ionicons style={{ fontSize: 20, color: 'white' }} name="chevron-forward"/>
+  </View>;
+
+const SeeQAndAButton = ({personUuid, name}: {
+  personUuid: string | null | undefined,
+  name: string | undefined,
+}) => {
+  const onPress = useNavigationToInDepth(personUuid);
+
+  return (
+    <ButtonWithCenteredText
+      containerStyle={styles.seeQAndAButtonContainer}
+      textStyle={styles.seeQAndAButtonText}
+      onPress={onPress}
+      extraChildren={seeQAndAButtonChevron}
+      loading={name === undefined}
+      borderColor="rgba(255, 255, 255, 0.2)"
+      borderWidth={1}
+    >
+      {possessive(String(name))} Q&A Answers
+    </ButtonWithCenteredText>
+  );
+};
+
+const BlockButton = ({name, personUuid, backgroundColor}: {
+  name: string | undefined,
+  personUuid: string | null | undefined,
+  backgroundColor: string,
+}) => {
+  const { isSkipped, isLoading, isPosting } = useSkipped(personUuid);
+  const surface = legibleSurface(backgroundColor);
+  const { hovered, hoverProps } = useHover();
+  const { pressed, pressProps } = usePressed();
+
+  const onPress = useCallback(async () => {
+    if (personUuid == null) return;
+
+    if (isSkipped) {
+      await postSkipped(personUuid, false);
+    } else {
+      if (name === undefined) return;
+
+      const data: ReportModalInitialData = {
+        name,
+        personUuid,
+        context: 'Prospect Profile Screen',
+      };
+      notify('open-report-modal', data);
+    }
+  }, [notify, name, personUuid, isSkipped]);
+
+  const text = isSkipped ?
+    `You have skipped ${name}. Press to unskip.` :
+    `Report ${name}`;
+
+  const iconStroke = isLoading ? "transparent" : surface.color;
+
+  return (
+    <AnimatedPressable
+      onPress={onPress}
+      style={[
+        profilePillButtonStyle(surface, pressed, hovered),
+        hoverTransition(pressed ? 'none' : 'top'),
+        { marginBottom: 100 },
+      ]}
+      {...hoverProps}
+      {...pressProps}
+    >
+      <PillRiseEdge surface={surface} hovered={hovered} pressed={pressed} />
+      {isPosting &&
+        <LogoActivityIndicator size="small" color="#70f"/>
+      }
+      {!isLoading && isSkipped &&
+        <RotateCcw
+          stroke={iconStroke}
+          strokeWidth={2}
+          height={18}
+          width={18}
+        />
+      }
+      {!isLoading && !isSkipped &&
+        <Flag
+          stroke={iconStroke}
+          strokeWidth={2}
+          height={18}
+          width={18}
+        />
+      }
+      {!isLoading &&
+        <DefaultText style={profilePillButtonTextStyle(surface)}>
+          {name === undefined ? '...' : text}
+        </DefaultText>
+      }
+    </AnimatedPressable>
+  );
+};
+
+type AllClubsChild =
+  | { kind: 'Title', kids: ReactNode, props: { style?: TextStyle } }
+  | { kind: 'Club', kids: ReactNode, props: {
+      onPress?: (view: View) => void,
+      key: string,
+      name: string,
+      isMutual: boolean,
+      style?: ViewStyle,
+      textStyle?: TextStyle,
+    } };
+
+const AllClubsItem = ({child}: {child: AllClubsChild}) => {
+  if (child.kind === 'Title') {
+    return <Title style={child.props.style}>{child.kids}</Title>;
+  }
+
+  return (
+    <Club
+      name={child.props.name}
+      isMutual={child.props.isMutual}
+      style={child.props.style}
+      textStyle={child.props.textStyle}
+      onPress={child.props.onPress}
+    />
+  );
+};
+
+const AllClubs = ({
+  mutualClubs,
+  otherClubs,
+  clubsTheme,
+  titleColor,
+}: {
+  mutualClubs: string[],
+  otherClubs: string[],
+  clubsTheme: { style?: ViewStyle, textStyle?: TextStyle },
+  titleColor: string | undefined,
+}) => {
+  const [signedInUser] = useSignedInUser();
+  const prospectClubs = [...mutualClubs, ...otherClubs];
+  const viewerClubNames = useJoinedClubs() ?? mutualClubs;
+  const mutual = _.intersection(viewerClubNames, prospectClubs);
+  const other = _.difference(prospectClubs, viewerClubNames);
+
+  if (mutual.length === 0 && other.length === 0) {
+    return null;
+  }
+
+  // Club cards hit authenticated endpoints, so anon viewers see clubs but
+  // can't interact with them.
+  const onPressClub = signedInUser ? pressClub : undefined;
+
+  const childData: (AllClubsChild | null)[] = [
+    mutual.length > 0 ? {
+      kind: 'Title',
+      props: { style: {color: titleColor, width: '100%'}},
+      kids: 'Mutual clubs' } : null,
+
+    ...mutual.map((clubName): AllClubsChild => ({
+        kind: 'Club',
+        props: {
+          onPress: onPressClub?.(clubName),
+          key: clubName,
+          name: clubName,
+          isMutual: true,
+          ...clubsTheme,
+        },
+        kids: null,
+      })),
+
+      (other.length > 0 && mutual.length > 0) ? {
+        kind: 'Title',
+        props: { style: {color: titleColor, width: '100%'}},
+        kids: 'Other clubs' } : null,
+
+      (other.length > 0 && mutual.length === 0) ? {
+        kind: 'Title',
+        props: { style: {color: titleColor, width: '100%'}},
+        kids: 'Clubs' } : null,
+
+      ...other.map((clubName): AllClubsChild => ({
+        kind: 'Club',
+        props: {
+          onPress: onPressClub?.(clubName),
+          key: clubName,
+          name: clubName,
+          isMutual: false,
+          ...clubsTheme,
+        },
+        kids: null,
+      })),
+  ];
+
+  return (
+    <Clubs>
+      {childData.filter((c): c is AllClubsChild => c !== null).map((d) =>
+        <Reanimated.View
+          key={
+            JSON.stringify({
+              kind: d.kind,
+              kids: d.kids,
+              clubName: d.kind === 'Club' ? d.props.name : undefined,
+            })
+          }
+          style={d.kind === 'Title' ? styles.wFull : styles.maxWFull}
+          layout={LinearTransition.easing(Easing.bezier(0.25, 1, 0.5, 1))}
+          exiting={FadeOut}
+        >
+          <AllClubsItem child={d} />
+        </Reanimated.View>
+      )}
+    </Clubs>
+  );
+};
+
+type UserData = {
+  name: string,
+  url_slug: string,
+  person_uuid: string,
+  about: string,
+  mutual_clubs: string[],
+  other_clubs: string[],
+  spotify_artists: SpotifyArtistItem[],
+  gender: string,
+  match_percentage: number | null,
+  photo_uuids: string[],
+  photo_extra_exts: string[][],
+  photo_blurhashes: string[],
+  photo_verifications: boolean[],
+  photo_geometries: (PhotoGeometry | null)[],
+  audio_bio_uuid: string | null,
+  age: number | null,
+  location: string | null
+  body_type: string | null,
+  drinking: string | null,
+  drugs: string | null,
+  ethnicity: string | null,
+  exercise: string | null,
+  has_kids: string | null,
+  height_cm: number | null,
+  long_distance: string | null,
+  looking_for: string[],
+  gender_preference: string[] | null,
+  age_preference: { min_age: number | null, max_age: number | null } | null,
+  show_my_looking_for: string | null,
+  occupation: string | null,
+  education: string | null,
+  orientation: string | null,
+  relationship_status: string | null,
+  religion: string | null,
+  smoking: string | null,
+  star_sign: string | null,
+  wants_kids: string | null,
+  is_skipped: boolean,
+  person_id: number,
+
+  verified_age: boolean,
+  verified_gender: boolean,
+  verified_ethnicity: boolean,
+
+  theme: {
+    title_color: string,
+    body_color: string,
+    background_color: string,
+  }
+
+  flair: string[]
+
+  // Stats
+  count_answers: number | null,
+  seconds_since_last_online: number | null,
+  seconds_since_sign_up: number | null,
+  gets_reply_percentage: number | null,
+  gives_reply_percentage: number | null,
+
+  similar_profiles?: PageItem[],
+};
+
+type FetchedUserData = UserData & { fetchedAt: number };
+
+const verificationLevelId = (data: UserData | null | undefined): 1 | 2 | 3 => {
+  // This should be provided by the backend instead
+
+  if (!data) {
+    return 1;
+  }
+
+  const hasVerifiedBasics = data.verified_gender && data.verified_age;
+  const hasVerififiedPhotos = data.photo_verifications.some(Boolean);
+
+  if (hasVerifiedBasics && hasVerififiedPhotos) {
+    return 3;
+  }
+
+  if (hasVerifiedBasics) {
+    return 2;
+  }
+
+  return 1;
+};
+
+const verifiedAnything = (data: UserData | null | undefined): boolean => {
+  if (!data) {
+    return false;
+  }
+
+  return Boolean(
+    data.photo_verifications.some(Boolean) ||
+    data.verified_gender ||
+    data.verified_age ||
+    data.verified_ethnicity
+  );
+};
+
+const hasAnyStats = (data: UserData | null | undefined): boolean => {
+  if (data === undefined) {
+    return true;
+  }
+
+  if (data === null) {
+    return true;
+  }
+
+  return (
+    data.count_answers !== null ||
+    data.seconds_since_last_online !== null ||
+    data.seconds_since_sign_up !== null ||
+    data.gets_reply_percentage !== null ||
+    data.gives_reply_percentage !== null
+  );
+};
+
+// Whether any Basics pill would render. Returns true while data is still
+// loading so the section doesn't flicker in once the response lands.
+const hasAnyBasics = (data: UserData | null | undefined): boolean => {
+  if (data === undefined || data === null) {
+    return true;
+  }
+
+  return Boolean(
+    data.orientation ||
+    data.ethnicity ||
+    data.relationship_status ||
+    data.occupation ||
+    data.education ||
+    data.has_kids ||
+    data.wants_kids ||
+    data.smoking ||
+    data.drinking ||
+    data.drugs ||
+    data.religion ||
+    data.star_sign ||
+    data.exercise ||
+    data.height_cm ||
+    data.body_type
+  );
+};
+
+const useProfileBackgroundColor = (data: UserData | undefined): string => {
+  const { appThemeName, appTheme } = useAppTheme();
+
+  const uncappedBackgroundColor = data?.theme?.background_color
+      ?? appTheme.primaryColor;
+
+  return appThemeName === 'dark'
+    ? capLuminance(uncappedBackgroundColor)
+    : uncappedBackgroundColor;
+};
+
+const firstOrNull = <T,>(xs: T[] | undefined): T | null | undefined =>
+  xs === undefined ? undefined : xs[0] ?? null;
+
+const primaryPhotoBlurhash = (handle: string, data: UserData | undefined) =>
+  getProspectHint(handle)?.photoBlurhash || firstOrNull(data?.photo_blurhashes);
+
+const useNavigationToInDepth = (personUuid: string | null | undefined) => {
+  const navigation = useNavigation<NativeStackNavigationProp<RootParamList>>();
+
+  return useCallback(() => {
+    if (!personUuid) return;
+    navigation.navigate(
+      'Prospect Profile Screen',
+      { screen: 'In-Depth', params: { personUuid } },
+    );
+  }, [navigation, personUuid]);
+};
+
+const PROSPECT_PROFILE_CACHE_TTL_MS = 5 * 60 * 1000;
+
+type ProspectProfileCache = Record<string, FetchedUserData>;
+
+const isFresh = (profile: FetchedUserData) =>
+  Date.now() - profile.fetchedAt < PROSPECT_PROFILE_CACHE_TTL_MS;
+
+const readProspectProfileCache = async (): Promise<ProspectProfileCache> => {
+  try {
+    const cache: ProspectProfileCache =
+      JSON.parse((await storeKv('prospect_profiles')) || '{}');
+    return _.pickBy(cache, isFresh);
+  } catch {
+    return {};
+  }
+};
+
+const cachedProspectProfile = async (
+  handle: string,
+): Promise<FetchedUserData | undefined> =>
+  Object.values(await readProspectProfileCache()).find((profile) =>
+    (profile.person_uuid === handle || profile.url_slug === handle) &&
+    (isMobile() || profile.similar_profiles !== undefined));
+
+const cacheProspectProfile = async (profile: FetchedUserData) =>
+  storeKv(
+    'prospect_profiles',
+    JSON.stringify({
+      ...(await readProspectProfileCache()),
+      [profile.person_uuid]: profile,
+    }),
+  );
+
+const resetProspectProfileCache = () => storeKv('prospect_profiles', null);
+
+const prospectProfilePath = (
+  handle: string,
+  isAnonymousViewer: boolean,
+) => {
+  const similarProfilesQuery = isMobile()
+    ? 'false'
+    : (isAnonymousViewer && encodedAnonymousAnswers()) || 'true';
+  return `/prospect-profile/${handle}?similar_profiles=${similarProfilesQuery}`;
+};
+
+const useProspectProfile = (
+  handle: string | undefined,
+  { preferCache = false }: { preferCache?: boolean } = {},
+) => {
+  const [signedInUser] = useSignedInUser();
+  const [result, setResult] = useState<{
+    handle: string,
+    data: FetchedUserData | undefined,
+    notFound: boolean,
+  }>();
+
+  useEffect(() => {
+    if (!handle) return;
+    let cancelled = false;
+    (async () => {
+      const cached = await cachedProspectProfile(handle);
+      if (cancelled) return;
+      if (cached) {
+        setResult({ handle, data: cached, notFound: false });
+        setProspectHint(cached.person_uuid, {
+          personId: cached.person_id,
+          name: cached.name,
+          urlSlug: cached.url_slug,
+        });
+      }
+      if (cached && preferCache) return;
+      // The skip cache is keyed by the canonical uuid. When the handle is a
+      // uuid, or the cache supplies one, we can show the "fetching" state
+      // immediately; for a slug we settle it once the profile (which carries
+      // `person_uuid`) lands.
+      const knownUuid = cached?.person_uuid ?? (
+        isUuid(handle) ? handle : undefined);
+      if (knownUuid) {
+        setSkipped(knownUuid, { networkState: 'fetching' });
+      }
+      const response = await api<UserData>(
+        'get', prospectProfilePath(handle, !signedInUser));
+      if (cancelled) return;
+      const profile =
+        response?.json && { ...response.json, fetchedAt: Date.now() };
+      setResult({ handle, data: profile, notFound: response.clientError });
+      if (profile && profile.person_uuid !== signedInUser?.personUuid) {
+        cacheProspectProfile(profile);
+      }
+      const canonicalUuid = response?.json?.person_uuid ?? (
+        isUuid(handle) ? handle : undefined);
+      if (canonicalUuid) {
+        setSkipped(
+          canonicalUuid,
+          {
+            isSkipped: response?.json?.is_skipped ?? false,
+            networkState: 'settled',
+          }
+        );
+      }
+      if (!profile) return;
+      // Make `personId` / `name` available to sibling screens (e.g. In-Depth,
+      // navigated to by the canonical uuid) so they don't have to refetch
+      // this endpoint just to resolve the numeric id required by `/compare-*`
+      // APIs.
+      setProspectHint(profile.person_uuid, {
+        personId: profile.person_id,
+        name: profile.name,
+        urlSlug: profile.url_slug,
+      });
+    })();
+    return () => { cancelled = true; };
+  }, [handle, signedInUser?.personUuid, preferCache]);
+
+  const current = result?.handle === handle ? result : undefined;
+
+  return {
+    data: current?.data,
+    notFound: current?.notFound ?? false,
+    personUuid: current?.data?.person_uuid ??
+      (handle && isUuid(handle) ? handle : undefined),
+  };
+};
+
+const ProspectProfile = ({
+  handle,
+  data,
+  canReply,
+  showShareAndReport,
+  paddingBottom,
+  besideSidePanel,
+  onColumnLeft,
+}: {
+  handle: string,
+  data: FetchedUserData | undefined,
+  canReply: boolean,
+  showShareAndReport: boolean,
+  paddingBottom: number,
+  besideSidePanel?: boolean,
+  onColumnLeft?: (columnLeft: number) => void,
+}) => {
+  const personUuid = data?.person_uuid ?? (isUuid(handle) ? handle : undefined);
+  const [roundPrimaryPhoto, setRoundPrimaryPhoto] = useState(false);
+  const backgroundColor = useProfileBackgroundColor(data);
+
+  const animatedStyle = useAnimatedStyle(
+    () => ({ backgroundColor: withTiming(backgroundColor) }),
+    [backgroundColor]
+  );
+
+  const album = useMemo(
+    () => buildAlbum(
+      data?.photo_uuids,
+      data?.photo_extra_exts,
+      data?.photo_geometries,
+      data?.photo_blurhashes,
+    ),
+    [
+      data?.photo_uuids,
+      data?.photo_extra_exts,
+      data?.photo_geometries,
+      data?.photo_blurhashes,
+    ],
+  );
+
+  return (
+    <ScrollView
+      style={{ backgroundColor }}
+      scrollsChildToFocus={false}
+      onLayout={(e) =>
+        setRoundPrimaryPhoto(e.nativeEvent.layout.width > COLUMN_MAX_WIDTH)}
+    >
+      <Reanimated.View style={animatedStyle}>
+        <HeartBackground>
+          <SidePanelLayout right={besideSidePanel} onColumnLeft={onColumnLeft}>
+            <View style={{ paddingBottom }}>
+              <EnlargeablePhoto
+                photoUuid={firstOrNull(data?.photo_uuids)}
+                photoExtraExts={firstOrNull(data?.photo_extra_exts)}
+                photoBlurhash={primaryPhotoBlurhash(handle, data)}
+                photoGeometry={album[0]?.geometry}
+                album={album}
+                isPrimary={true}
+                isVerified={data?.photo_verifications[0]}
+                borderRadius={
+                  roundPrimaryPhoto ? primaryPhotoBigScreenRadii : undefined}
+                style={
+                  roundPrimaryPhoto ?
+                  commonStyles.primaryEnlargeablePhotoBigScreen :
+                  undefined
+                }
+              />
+              <ProspectUserDetails
+                personUuid={personUuid}
+                name={data?.name}
+                age={data?.age}
+                gender={data?.gender}
+                userLocation={data?.location}
+                verified={verificationLevelId(data) > 1}
+                matchPercentage={data?.match_percentage}
+                titleColor={data?.theme?.title_color}
+                bodyColor={data?.theme?.body_color}
+              />
+              <Body
+                personUuid={personUuid}
+                data={data}
+                canReply={canReply}
+                showShareAndReport={showShareAndReport}
+              />
+            </View>
+          </SidePanelLayout>
+        </HeartBackground>
+      </Reanimated.View>
+    </ScrollView>
+  );
+};
+
+const ProspectProfilePanel = memo(({ handle, data, style }: {
+  handle: string,
+  data: FetchedUserData | undefined,
+  style: ViewStyle,
+}) => {
+  const backgroundColor = useProfileBackgroundColor(data);
+
+  return (
+    <SidePanelCard
+      surface={{
+        backgroundColor,
+        borderColor: legibleSurface(backgroundColor).borderColor,
+      }}
+      style={style}
+    >
+      <ProspectProfile
+        handle={handle}
+        data={data}
+        canReply={false}
+        showShareAndReport={false}
+        paddingBottom={0}
+      />
+    </SidePanelCard>
+  );
+});
+
+const Content = ({navigation, route}: ProspectScreenProps) => {
+  const insets = useSafeAreaInsets();
+
+  // The route param is a "handle": either a uuid (legacy/shared links) or a
+  // url_slug. It drives the URL, the initial fetch and the caller-supplied
+  // hints (all keyed by whatever the caller navigated with). Uuid-keyed actions
+  // (skip, online presence, chat) instead need the *canonical* uuid, which we
+  // read from the fetched profile (`data.person_uuid`); when the handle is
+  // already a uuid we can use it immediately, otherwise it resolves once `data`
+  // lands.
+  const handle = route.params.personUuid;
+
+  const [signedInUser] = useSignedInUser();
+
+  const { data, notFound, personUuid } =
+    useProspectProfile(handle);
+
+  // `showBottomButtons` and `photoBlurhash` are intentionally NOT route params:
+  // the former is derived from who's signed in (plus an optional one-shot
+  // hint from the caller), the latter is an optimistic rendering hint stashed
+  // in prospect-cache by the navigating caller. This keeps URLs clean
+  // (`/:username`) and navigation state serializable.
+  const isViewingSelf =
+    !!signedInUser?.personUuid && (
+      signedInUser.personUuid === personUuid ||
+      signedInUser.personUuid === handle);
+  const isAnonymousViewer = !signedInUser;
+
+  const [columnLeft, setColumnLeft] = useState<number>();
+
+  useBackButtonClaim(
+    !isAnonymousViewer || Platform.OS === 'web'
+      ? {
+        layout: columnLeft ?? 'pending',
+        transition: Platform.OS === 'web' ? 'instant' : 'fade',
+        onPress: () => navigation.goBack(),
+      }
+      : null
+  );
+  // Consume the `hideBottomButtons` hint when a new handle lands here so a
+  // later visit from a different context (e.g. tapping the same person's
+  // avatar in search) gets the default behaviour rather than inheriting a
+  // stale conversation hint. Tracked in state because the same screen
+  // instance can be reused with a different `handle` without remount.
+  // Initialised lazily from the cache to avoid a one-frame flash of the
+  // bottom buttons before the consuming effect runs.
+  const [hideBottomButtonsHint, setHideBottomButtonsHint] = useState(
+    () => !!getProspectHint(handle)?.hideBottomButtons,
+  );
+  const [hintHandle, setHintHandle] = useState(handle);
+  if (hintHandle !== handle) {
+    setHintHandle(handle);
+    setHideBottomButtonsHint(!!getProspectHint(handle)?.hideBottomButtons);
+  }
+  useEffect(() => {
+    if (getProspectHint(handle)?.hideBottomButtons) {
+      setProspectHint(handle, { hideBottomButtons: false });
+    }
+  }, [handle]);
+
+  const showAuthedBottomButtons =
+    !isAnonymousViewer && !isViewingSelf && !hideBottomButtonsHint;
+
+  const { appTheme } = useAppTheme();
+  // Wait for `data` to resolve so the CTA doesn't briefly flash before
+  // `notFound` flips on for 404'd profiles.
+  const showAnonymousSignInCta =
+    isAnonymousViewer && !!data && !hideBottomButtonsHint;
+  useSkipped(personUuid, () => navigation.popToTop());
+
+  // Surface the prospect's name in the browser tab. We prefer the freshly
+  // fetched name but fall back to the optimistic hint while the API is in
+  // flight so the title doesn't briefly read "Duolicious" before snapping
+  // to the name. App.tsx's `documentTitle.formatter` reads `options.title`.
+  const screenTitle = data?.name ?? getProspectHint(handle)?.name;
+  useLayoutEffect(() => {
+    navigation.setOptions({ title: screenTitle });
+    setBannerProspectName(handle, screenTitle);
+  }, [navigation, handle, screenTitle]);
+
+  const backgroundColor = useProfileBackgroundColor(data);
+
+  const fitsSidePanel = useFitsSidePanels(1);
+  const similarProfiles = data?.similar_profiles ?? [];
+  const showSimilarProfiles = similarProfiles.length > 0 && fitsSidePanel;
+
+  return (
+    <>
+      {notFound &&
+        <View
+          style={{
+            flex: 1,
+            justifyContent: 'center',
+            alignItems: 'center',
+            backgroundColor: '#70f',
+            paddingHorizontal: 30,
+            gap: 14,
+          }}
+        >
+          {/* Anon 404s are ambiguous (private OR nonexistent) so we show a
+              sign-in CTA instead of "Profile not found". */}
+          <DefaultText
+            style={{
+              fontWeight: '900',
+              fontSize: 26,
+              color: appTheme.primaryColor,
+              textAlign: 'center',
+            }}
+          >
+            {isAnonymousViewer
+              ? 'Sign in to view this profile'
+              : 'Profile not found'}
+          </DefaultText>
+          {isAnonymousViewer &&
+            <DefaultText
+              style={{
+                fontSize: 16,
+                color: appTheme.primaryColor,
+                opacity: 0.85,
+                textAlign: 'center',
+              }}
+            >
+              This profile is only visible to signed-in users, or it may
+              not exist.
+            </DefaultText>
+          }
+        </View>
+      }
+      {!notFound && <>
+        <ProspectProfile
+          handle={handle}
+          data={data}
+          canReply={showAuthedBottomButtons}
+          showShareAndReport={true}
+          paddingBottom={
+            showAnonymousSignInCta && Platform.OS === 'web' ? 200 : 100}
+          besideSidePanel={showSimilarProfiles}
+          onColumnLeft={setColumnLeft}
+        />
+        <SidePanelLayout
+          style={styles.overlay}
+          right={showSimilarProfiles &&
+            <SimilarProfiles
+              items={similarProfiles}
+              backgroundColor={backgroundColor}
+            />
+          }
+        >
+          {showAuthedBottomButtons &&
+            <View
+              style={{
+                position: viewportPosition(),
+                bottom: insets.bottom,
+                width: '100%',
+                justifyContent: 'center',
+                flexDirection: 'row',
+              }}
+              pointerEvents="box-none"
+            >
+              <FloatingSkipButton
+                personUuid={personUuid}
+              />
+              <FloatingSendIntroButton
+                personUuid={personUuid}
+                urlSlug={data?.url_slug}
+                name={data?.name}
+                photoUuid={firstOrNull(data?.photo_uuids)}
+                photoBlurhash={primaryPhotoBlurhash(handle, data)}
+              />
+            </View>
+          }
+        </SidePanelLayout>
+        {showAnonymousSignInCta && Platform.OS !== 'web' &&
+          <AnonymousSignInCta
+            navigation={navigation}
+            name={data?.name}
+          />
+        }
+      </>}
+    </>
+  );
+};
+
+const ProspectUserDetails = ({
+  personUuid,
+  name,
+  age,
+  gender,
+  userLocation,
+  verified,
+  matchPercentage,
+  titleColor,
+  bodyColor,
+}: {
+  personUuid: string | null | undefined,
+  name: string | undefined,
+  age: number | null | undefined,
+  gender: string | undefined,
+  userLocation: string | null | undefined,
+  verified: boolean,
+  matchPercentage: number | null | undefined,
+  titleColor: string | undefined,
+  bodyColor: string | undefined,
+}) => {
+  const { appTheme } = useAppTheme();
+
+  const metaColor = bodyColor ?? appTheme.hintColor;
+
+  const onPressDonutChart = useNavigationToInDepth(personUuid);
+
+  return (
+    <View
+      style={{
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        margin: 10,
+        gap: 10,
+      }}
+    >
+      <View
+        style={{
+          flexShrink: 1,
+          gap: 5,
+        }}
+      >
+        <View
+          style={{
+            flexDirection: 'row',
+            flexShrink: 1,
+            alignItems: 'center',
+            gap: 8,
+          }}
+        >
+          <OnlineIndicator
+            personUuid={personUuid}
+            size={18}
+            borderWidth={1}
+          />
+          <DefaultText
+            style={{
+              fontWeight: 900,
+              fontSize: 26,
+              letterSpacing: -0.5,
+              flexShrink: 1,
+              color: titleColor,
+            }}
+          >
+            {/* The non-breaking space prevents the UI from jumping around too */}
+            {/* much while the content loads */}
+            {name ?? '\u00A0'}
+          </DefaultText>
+          {verified &&
+            <VerificationBadge/>
+          }
+        </View>
+        <View style={{ gap: 2 }}>
+          <DefaultText
+            style={{
+              textAlign: 'left',
+              fontSize: 15,
+              fontWeight: 500,
+              color: metaColor,
+            }}
+          >
+            <FontAwesomeIcon
+              icon={faUser}
+              style={{
+                transform: [ { translateY: 2 } ],
+              }}
+              color={metaColor}
+            />
+            {'\u2002'}
+            {[
+              age,
+              gender,
+            ].filter(Boolean).join(' • ')}
+          </DefaultText>
+          <DefaultText
+            style={{
+              textAlign: 'left',
+              fontSize: 15,
+              fontWeight: 500,
+              color: metaColor,
+            }}
+          >
+            <FontAwesomeIcon
+              icon={faLocationDot}
+              style={{
+                transform: [ { translateY: 2 } ],
+              }}
+              color={metaColor}
+            />
+            {'\u2002'}
+            {userLocation === null ? 'Private location' : userLocation}
+          </DefaultText>
+        </View>
+      </View>
+      {/* `null` = backend omitted the score (anon viewer); `undefined` =
+          still loading and should render the chart faded. */}
+      {matchPercentage !== null &&
+        <DonutChart
+          percentage={matchPercentage}
+          onPress={onPressDonutChart}
+          textStyle={{
+            color: titleColor,
+          }}
+        >
+          {(hovered) =>
+            <DefaultText
+              style={{
+                paddingBottom: 5,
+                fontWeight: '500',
+                fontSize: 10,
+                opacity: matchPercentage === undefined ? 0 : 1,
+                color: titleColor,
+                textDecorationLine: hovered ? 'underline' : 'none',
+              }}
+            >
+              See Why ›
+            </DefaultText>
+          }
+        </DonutChart>
+      }
+    </View>
+  );
+};
+
+const TimeAgo = ({ at }: { at: number }) => {
+  const label = useTimeSinceLabel(at, friendlyTimeAgo);
+
+  return <>{label} ago</>;
+};
+
+const LastOnlineStat = ({
+  personUuid,
+  data,
+  textStyle,
+}: {
+  personUuid: string | undefined,
+  data: FetchedUserData | undefined,
+  textStyle?: StyleProp<TextStyle>,
+}) => {
+  const presence = useOnline(personUuid);
+
+  const fetchedLastOnlineAt =
+    data === undefined || data.seconds_since_last_online === null ?
+    null :
+    data.fetchedAt - data.seconds_since_last_online * 1000;
+
+  const liveLastOnlineAt =
+    presence.status === 'online-recently' ? presence.lastOnlineAt : null;
+
+  const lastOnlineAt = liveLastOnlineAt ?? fetchedLastOnlineAt;
+
+  return (
+    <Stat textStyle={textStyle}>
+      <DefaultText disableTheme style={{ fontWeight: '700' }}>
+        Last Online: {}
+      </DefaultText>
+      {
+        presence.status === 'online' ?
+        'Now' :
+        lastOnlineAt === null ?
+        'Loading...' :
+        <TimeAgo at={lastOnlineAt} />
+      }
+    </Stat>
+  );
+};
+
+const Body = ({
+  personUuid,
+  data,
+  canReply,
+  showShareAndReport,
+}: {
+  personUuid: string | undefined,
+  data: FetchedUserData | undefined,
+  canReply: boolean,
+  showShareAndReport: boolean,
+}) => {
+  const { appThemeName, appTheme } = useAppTheme();
+  const [signedInUser] = useSignedInUser();
+
+  const album = useMemo(
+    () => buildAlbum(
+      data?.photo_uuids,
+      data?.photo_extra_exts,
+      data?.photo_geometries,
+      data?.photo_blurhashes,
+    ),
+    [
+      data?.photo_uuids,
+      data?.photo_extra_exts,
+      data?.photo_geometries,
+      data?.photo_blurhashes,
+    ],
+  );
+
+  const profilePhoto = (position: number) => (
+    <EnlargeablePhoto
+      photoUuid={data?.photo_uuids?.[position]}
+      photoExtraExts={data?.photo_extra_exts?.[position]}
+      photoBlurhash={data?.photo_blurhashes?.[position]}
+      photoGeometry={album[position]?.geometry}
+      album={album}
+      borderRadius={12}
+      style={commonStyles.secondaryEnlargeablePhoto}
+      innerStyle={commonStyles.secondaryEnlargeablePhotoInner}
+      isPrimary={false}
+      isVerified={data?.photo_verifications?.[position] ?? false}
+    />
+  );
+
+  // Compare on UUID rather than the numeric `personId` we lift out of `data`,
+  // so the "Block" button doesn't briefly render before the API response lands.
+  const isViewingSelf =
+    !!signedInUser?.personUuid && signedInUser.personUuid === personUuid;
+
+  const backgroundColor = useProfileBackgroundColor(data);
+
+  const lookingForCardColors = themedSurface(
+    appThemeName,
+    appTheme.surface,
+    data?.theme?.body_color,
+  );
+
+  const basicsTheme = {
+    textStyle: {
+      color: data?.theme?.body_color,
+    },
+  };
+
+  const clubsTheme = {
+    textStyle: {
+      color: data?.theme?.body_color,
+    },
+  };
+
+  const statsTheme = {
+    textStyle: {
+      color: data?.theme?.body_color,
+    },
+  };
+
+  return (
+    <>
+      <View
+        style={{
+          paddingTop: 10,
+          paddingLeft: 10,
+          paddingRight: 10,
+          marginBottom: 20,
+        }}
+      >
+        <Flair flair={data?.flair ?? []} />
+        {data?.show_my_looking_for === 'Yes' &&
+          <View
+            style={{
+              flexDirection: 'row',
+              alignItems: 'center',
+              gap: 14,
+              paddingVertical: 14,
+              paddingHorizontal: 16,
+              marginTop: 20,
+              marginBottom: 5,
+              borderRadius: 12,
+              borderWidth: 1,
+              ...lookingForCardColors,
+            }}
+          >
+            <DefaultText style={{ fontSize: 34, lineHeight: 40 }}>
+              {lookingForEmoji(data)}
+            </DefaultText>
+            <View style={{ flex: 1 }}>
+              <DefaultText
+                style={{
+                  color: data?.theme?.body_color,
+                }}
+              >
+                Looking for
+              </DefaultText>
+              <DefaultText
+                style={{
+                  flexShrink: 1,
+                  fontSize: 16,
+                  lineHeight: 22,
+                  color: data?.theme?.body_color,
+                  fontWeight: 700,
+                }}
+              >
+                {data ? lookingForDescription(data) : ''}
+              </DefaultText>
+            </View>
+          </View>
+        }
+
+        {data?.audio_bio_uuid &&
+          <AudioPlayer
+            name={data?.name}
+            uuid={data?.audio_bio_uuid}
+            presentation="profile"
+            bodyColor={data?.theme?.body_color}
+          />
+        }
+
+        {hasAnyBasics(data) && <>
+        <Title style={{color: data?.theme?.title_color}}>Basics</Title>
+        <Basics>
+          {data?.orientation &&
+            <Basic {...basicsTheme} icon="person">{data.orientation}</Basic>}
+
+          {data?.ethnicity &&
+            <Basic {...basicsTheme} icon="globe-outline">{data.ethnicity}</Basic>}
+
+          {data?.relationship_status &&
+            <Basic {...basicsTheme} icon="heart">{data.relationship_status}</Basic>}
+
+          {data?.occupation &&
+            <Basic {...basicsTheme} icon="briefcase">{data.occupation}</Basic>}
+
+          {data?.education &&
+            <Basic {...basicsTheme} icon="school">{data.education}</Basic>}
+
+          {data?.has_kids === 'Yes' &&
+            <Basic {...basicsTheme} icon={faChild}>Has kids</Basic>}
+          {data?.has_kids === 'No' &&
+            <Basic {...basicsTheme} icon={faChild}>Doesn’t have kids</Basic>}
+
+          {data?.wants_kids === 'Yes' &&
+            <Basic {...basicsTheme} icon={faChildren}>Wants kids</Basic>}
+          {data?.wants_kids === 'No' &&
+            <Basic {...basicsTheme} icon={faChildren}>Doesn’t want kids</Basic>}
+          {data?.wants_kids === 'Maybe' &&
+            <Basic {...basicsTheme} icon={faChildren}>Maybe wants kids</Basic>}
+
+          {data?.smoking === 'Yes' &&
+            <Basic {...basicsTheme} icon={faSmoking}>Smokes</Basic>}
+          {data?.smoking === 'No' &&
+            <Basic {...basicsTheme} icon={faSmoking}>Doesn’t smoke</Basic>}
+
+          {data?.drinking &&
+            <Basic {...basicsTheme} icon="wine">{data.drinking} drinks</Basic>}
+
+          {data?.drugs === 'Yes' &&
+            <Basic {...basicsTheme} icon={faPills}>Does drugs</Basic>}
+          {data?.drugs === 'No' &&
+            <Basic {...basicsTheme} icon={faPills}>Doesn’t do drugs</Basic>}
+
+          {data?.religion &&
+            <Basic {...basicsTheme} icon={faHandsPraying}>{data.religion}</Basic>}
+
+          {data?.star_sign &&
+            <Basic {...basicsTheme} icon="star">{data.star_sign}</Basic>}
+
+          {data?.exercise &&
+            <Basic {...basicsTheme} icon="barbell">{data.exercise} exercises</Basic>}
+
+          {data?.body_type &&
+            <Basic {...basicsTheme} icon="body">{data.body_type}</Basic>}
+
+          {data?.height_cm && signedInUser?.units === 'Metric' &&
+            <Basic {...basicsTheme} icon={faRulerVertical}>{data.height_cm} cm</Basic>}
+          {data?.height_cm && signedInUser?.units === 'Imperial' &&
+            <Basic {...basicsTheme} icon={faRulerVertical}>{cmToFeetInchesStr(data.height_cm)}</Basic>}
+        </Basics>
+        </>}
+
+        {verifiedAnything(data) && <>
+          <Title style={{color: data?.theme?.title_color}}>Verification</Title>
+          <DetailedVerificationBadges
+            photos={(data?.photo_verifications ?? []).some(Boolean)}
+            gender={data?.verified_gender ?? false}
+            age={data?.verified_age ?? false}
+            ethnicity={data?.verified_ethnicity ?? false}
+            style={{
+              marginBottom: 5,
+            }}
+          />
+          <DefaultText
+            style={{
+              color: bestTextOn(backgroundColor),
+              opacity: 0.5,
+              marginBottom: 10,
+            }}
+          >
+            Verification is based on selfies checked by AI. Verified
+            photos are most accurate.
+          </DefaultText>
+        </>}
+
+        {profilePhoto(1)}
+
+        {!data?.name &&
+          <Title style={{color: data?.theme?.title_color}}>About ...</Title>
+        }
+        {!!data?.name && !!data?.about && data.about.trim() &&
+          <>
+            <Title style={{color: data?.theme?.title_color}}>About {data.name}</Title>
+            <AboutText
+              name={data.name}
+              about={data.about}
+              color={data?.theme?.body_color}
+              canReply={canReply}
+            />
+          </>
+        }
+
+        {profilePhoto(2)}
+
+        {profilePhoto(3)}
+
+        <AllClubs
+          mutualClubs={data?.mutual_clubs ?? []}
+          otherClubs={data?.other_clubs ?? []}
+          clubsTheme={clubsTheme}
+          titleColor={data?.theme?.title_color}
+        />
+
+        {profilePhoto(4)}
+
+        {profilePhoto(5)}
+
+        {profilePhoto(6)}
+
+        {(data?.spotify_artists ?? []).length > 0 && <>
+          <SpotifyTitle color={data?.theme?.title_color}/>
+          <SpotifyArtists
+            artists={data?.spotify_artists ?? []}
+            textStyle={clubsTheme.textStyle}
+          />
+        </>}
+
+        {hasAnyStats(data) && <>
+          <Title style={{color: data?.theme?.title_color}}>Stats</Title>
+          <Stats>
+            {data?.seconds_since_last_online !== null &&
+              <LastOnlineStat
+                personUuid={personUuid}
+                data={data}
+                textStyle={statsTheme.textStyle}
+              />
+            }
+            {data?.count_answers !== null &&
+              <Stat {...statsTheme}>
+                <DefaultText disableTheme style={{ fontWeight: '700' }}>
+                  Q&A Answers: {}
+                </DefaultText>
+                {data?.count_answers ?? 'Loading...'}
+              </Stat>
+            }
+            {data && !_.isNil(data.gives_reply_percentage) &&
+              <Stat {...statsTheme}>
+                <DefaultText disableTheme style={{ fontWeight: '700' }}>
+                  Gives Replies To: {}
+                </DefaultText>
+                {Math.round(data.gives_reply_percentage)}% of intros
+              </Stat>
+            }
+            {data && !_.isNil(data.gets_reply_percentage) &&
+              <Stat {...statsTheme}>
+                <DefaultText disableTheme style={{ fontWeight: '700' }}>
+                  Gets Replies To: {}
+                </DefaultText>
+                {Math.round(data.gets_reply_percentage)}% of intros
+              </Stat>
+            }
+            {data?.seconds_since_sign_up !== null &&
+              <Stat {...statsTheme}>
+                <DefaultText disableTheme style={{ fontWeight: '700' }}>
+                  Account Age: {}
+                </DefaultText>
+                {
+                  data === undefined ?
+                  'Loading...' :
+                  friendlyTimeAgo(data.seconds_since_sign_up * 1000)
+                }
+              </Stat>
+            }
+          </Stats>
+        </>}
+
+        {!!data?.count_answers && !!signedInUser &&
+          <SeeQAndAButton
+            personUuid={personUuid}
+            name={data?.name}
+          />}
+        {showShareAndReport &&
+          <ShareButton
+            personUuid={data?.url_slug}
+            backgroundColor={backgroundColor}
+          />}
+        {showShareAndReport && !isViewingSelf && !!signedInUser &&
+          <BlockButton
+            name={data?.name}
+            personUuid={personUuid}
+            backgroundColor={backgroundColor}
+          />}
+      </View>
+    </>
+  );
+};
+
+const styles = StyleSheet.create({
+  seeQAndAButtonContainer: {
+    marginTop: 40,
+    marginLeft: 10,
+    marginRight: 10,
+  },
+  seeQAndAButtonText: {
+    marginLeft: 35,
+    marginRight: 35,
+  },
+  overlay: {
+    ...StyleSheet.absoluteFill,
+    zIndex: 999,
+  },
+  wFull: {
+    width: '100%',
+  },
+  maxWFull: {
+    maxWidth: '100%',
+  },
+  audioPlayerMiddleText: {
+    fontWeight: 700,
+    flex: 3,
+    ...(Platform.OS === 'web' ? {
+      wordBreak: 'break-all',
+    } : {}),
+    textAlign: 'center',
+  },
+});
+
+export {
+  InDepthScreen,
+  ProspectProfilePanel,
+  ProspectProfileScreen,
+  resetProspectProfileCache,
+  useProspectProfile,
+};
+export type { FetchedUserData };
